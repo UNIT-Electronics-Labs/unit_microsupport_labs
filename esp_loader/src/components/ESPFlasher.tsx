@@ -66,7 +66,8 @@ export default function ESPFlasher() {
   async function loadDefaultFirmware() {
     try {
       addLog("Cargando firmware por defecto...\n");
-      const response = await fetch("/firmware/momo.ino.merged.bin");
+      const firmwareUrl = `${import.meta.env.BASE_URL}firmware/momo.ino.merged.bin`;
+      const response = await fetch(firmwareUrl);
       addLog(`Respuesta HTTP: ${response.status} ${response.statusText}\n`);
       
       if (!response.ok) {

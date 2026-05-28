@@ -912,6 +912,7 @@ export default function ESPFlasher() {
             >
               Reset ESP32
             </button>
+
           </div>
         </div>
 

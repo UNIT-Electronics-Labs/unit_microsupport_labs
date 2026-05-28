@@ -1,5 +1,6 @@
 {
   "files": [
+    "micropython_esp32c6.bin",
     "micropython_esp32h2.bin",
     "momo_esp32h2_bmi160.bin",
     "momo_esp32h2_bmi270.bin"

@@ -5,6 +5,17 @@ import {
   type Transport as DapTransport,
   WebUSB as DapWebUSB,
 } from "dapjs";
+import { flashPy32F0, PY32_DAP_WAIT_RETRY, PY32_DBGMCU_IDCODE_ADDRESS } from "../cortex/flash/py32f0";
+import { flashStm32F1, STM32_DBGMCU_IDCODE_ADDRESS } from "../cortex/flash/stm32f1";
+import { parseFirmwareImage } from "../cortex/firmware";
+import { TARGETS, type TargetKey } from "../cortex/targets";
+import {
+  formatBytes,
+  formatHex32,
+  getDebugDeviceId,
+  getDebugRevisionId,
+  getErrorMessage,
+} from "../cortex/utils";
 
 const DAP_INFO_REQUESTS = {
   VENDOR_ID: 0x01,
@@ -27,49 +38,15 @@ const CMSIS_DAP_USB_FILTERS = [
 ] as const;
 
 const CORTEX_CPUID_ADDRESS = 0xe000ed00;
-const STM32_DBGMCU_IDCODE_ADDRESS = 0xe0042000;
-const STM32_FLASH_KEYR = 0x40022004;
-const STM32_FLASH_SR = 0x4002200c;
-const STM32_FLASH_CR = 0x40022010;
-const STM32_FLASH_AR = 0x40022014;
-const STM32_FLASH_KEY1 = 0x45670123;
-const STM32_FLASH_KEY2 = 0xcdef89ab;
-const STM32_FLASH_SR_BSY = 1 << 0;
-const STM32_FLASH_SR_PGERR = 1 << 2;
-const STM32_FLASH_SR_WRPRTERR = 1 << 4;
-const STM32_FLASH_SR_EOP = 1 << 5;
-const STM32_FLASH_CR_PG = 1 << 0;
-const STM32_FLASH_CR_PER = 1 << 1;
-const STM32_FLASH_CR_STRT = 1 << 6;
-const STM32_FLASH_CR_LOCK = 1 << 7;
-const STM32_FLASH_CLEAR_FLAGS =
-  STM32_FLASH_SR_PGERR | STM32_FLASH_SR_WRPRTERR | STM32_FLASH_SR_EOP;
 
-const TARGETS = {
-  stm32f103rc: {
-    label: "STM32F103RC",
-    description: "Cortex-M3, 256 KB flash",
-    flashBase: 0x08000000,
-    flashSizeBytes: 256 * 1024,
-    pageSize: 2048,
-    deviceId: 0x414,
-  },
-  gd32f150g8: {
-    label: "GD32F150G8",
-    description: "Cortex-M3, 64 KB flash",
-    flashBase: 0x08000000,
-    flashSizeBytes: 64 * 1024,
-    pageSize: 1024,
-  },
-} as const;
+type FamilyFilter = "all" | "stm32" | "py32" | "gd32";
 
-type TargetKey = keyof typeof TARGETS;
-
-type FirmwareImage = {
-  address: number;
-  data: Uint8Array;
-  format: "bin" | "elf";
-};
+const FAMILY_FILTERS = [
+  { id: "all", label: "Todos" },
+  { id: "stm32", label: "STM32" },
+  { id: "py32", label: "PY32" },
+  { id: "gd32", label: "GD32" },
+] as const satisfies ReadonlyArray<{ id: FamilyFilter; label: string }>;
 
 type WebHidInputReportEvent = Event & {
   data: DataView;
@@ -103,128 +80,8 @@ type WindowWithFilePicker = Window & {
   }) => Promise<FileSystemFileHandleLike[]>;
 };
 
-function getErrorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
 function formatUsbId(value?: number): string {
   return value === undefined ? "????" : value.toString(16).padStart(4, "0");
-}
-
-function formatHex32(value: number): string {
-  return `0x${(value >>> 0).toString(16).padStart(8, "0")}`;
-}
-
-function getStm32DeviceId(idcode: number): number {
-  return idcode & 0x0fff;
-}
-
-function getStm32RevisionId(idcode: number): number {
-  return (idcode >>> 16) & 0xffff;
-}
-
-function alignUp(value: number, alignment: number): number {
-  return Math.ceil(value / alignment) * alignment;
-}
-
-function formatBytes(value: number): string {
-  if (value < 1024) return `${value} bytes`;
-  return `${(value / 1024).toFixed(1)} KB`;
-}
-
-function getHalfwordFromRead(address: number, value: number): number {
-  return (value >>> ((address & 0x02) << 3)) & 0xffff;
-}
-
-function isElf(bytes: Uint8Array): boolean {
-  return (
-    bytes.length >= 4 &&
-    bytes[0] === 0x7f &&
-    bytes[1] === 0x45 &&
-    bytes[2] === 0x4c &&
-    bytes[3] === 0x46
-  );
-}
-
-function parseFirmwareImage(
-  bytes: Uint8Array,
-  fileName: string,
-  target: (typeof TARGETS)[TargetKey]
-): FirmwareImage {
-  if (!isElf(bytes)) {
-    if (!fileName.toLowerCase().endsWith(".bin")) {
-      throw new Error("Only raw .bin or 32-bit little-endian ARM .elf is supported");
-    }
-
-    return {
-      address: target.flashBase,
-      data: bytes,
-      format: "bin",
-    };
-  }
-
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-
-  if (view.getUint8(4) !== 1 || view.getUint8(5) !== 1) {
-    throw new Error("Only 32-bit little-endian ELF files are supported");
-  }
-
-  if (view.getUint16(18, true) !== 40) {
-    throw new Error("ELF is not for ARM");
-  }
-
-  const programHeaderOffset = view.getUint32(28, true);
-  const programHeaderEntrySize = view.getUint16(42, true);
-  const programHeaderCount = view.getUint16(44, true);
-  const flashStart = target.flashBase;
-  const flashEnd = target.flashBase + target.flashSizeBytes;
-  const segments: Array<{ address: number; data: Uint8Array }> = [];
-
-  for (let index = 0; index < programHeaderCount; index += 1) {
-    const offset = programHeaderOffset + index * programHeaderEntrySize;
-    const type = view.getUint32(offset, true);
-    if (type !== 1) continue;
-
-    const fileOffset = view.getUint32(offset + 4, true);
-    const virtualAddress = view.getUint32(offset + 8, true);
-    const physicalAddress = view.getUint32(offset + 12, true);
-    const fileSize = view.getUint32(offset + 16, true);
-    const address = physicalAddress || virtualAddress;
-
-    if (fileSize === 0 || address < flashStart || address >= flashEnd) continue;
-
-    if (address + fileSize > flashEnd) {
-      throw new Error(`ELF segment exceeds target flash at ${formatHex32(address)}`);
-    }
-
-    segments.push({
-      address,
-      data: bytes.slice(fileOffset, fileOffset + fileSize),
-    });
-  }
-
-  if (segments.length === 0) {
-    throw new Error("ELF has no loadable flash segments");
-  }
-
-  segments.sort((left, right) => left.address - right.address);
-
-  const startAddress = segments[0].address;
-  const endAddress = Math.max(
-    ...segments.map((segment) => segment.address + segment.data.length)
-  );
-  const image = new Uint8Array(endAddress - startAddress);
-  image.fill(0xff);
-
-  for (const segment of segments) {
-    image.set(segment.data, segment.address - startAddress);
-  }
-
-  return {
-    address: startAddress,
-    data: image,
-    format: "elf",
-  };
 }
 
 function looksLikeCmsisDapDevice(device: {
@@ -268,7 +125,7 @@ class WebHidCmsisDapTransport implements DapTransport {
   async close(): Promise<void> {
     if (this.device.opened) {
       await this.device.close();
-    }
+    } 
   }
 
   async read(): Promise<DataView> {
@@ -299,8 +156,21 @@ class WebHidCmsisDapTransport implements DapTransport {
   }
 }
 
+function createCortexTarget(transport: DapTransport): {
+  dap: CmsisDAP;
+  target: CortexM;
+} {
+  const dap = new CmsisDAP(transport);
+  return {
+    dap,
+    target: new CortexM(dap),
+  };
+}
+
 export default function CortexProgrammer() {
   const [selectedTarget, setSelectedTarget] = useState<TargetKey>("stm32f103rc");
+  const [familyFilter, setFamilyFilter] = useState<FamilyFilter>("all");
+  const [targetSearch, setTargetSearch] = useState("");
   const [logs, setLogs] = useState("");
   const [testing, setTesting] = useState(false);
   const [connectingTarget, setConnectingTarget] = useState(false);
@@ -311,10 +181,38 @@ export default function CortexProgrammer() {
     useState<FileSystemFileHandleLike | null>(null);
   const [firmwareName, setFirmwareName] = useState("");
   const [progress, setProgress] = useState(0);
+  const [showConsole, setShowConsole] = useState(false);
   const logsContainerRef = useRef<HTMLDivElement | null>(null);
 
   function addLog(text: string) {
     setLogs((prev) => prev + text);
+  }
+
+  const targetEntries = Object.entries(TARGETS) as Array<
+    [TargetKey, (typeof TARGETS)[TargetKey]]
+  >;
+  const normalizedSearch = targetSearch.trim().toLowerCase();
+  const filteredTargetEntries = targetEntries.filter(([key, target]) => {
+    const matchesFamily =
+      familyFilter === "all" || target.family === familyFilter;
+    const searchableText = `${key} ${target.label} ${target.description} ${target.family}`.toLowerCase();
+    return matchesFamily && searchableText.includes(normalizedSearch);
+  });
+  const selectedTargetAvailable = filteredTargetEntries.some(
+    ([key]) => key === selectedTarget
+  );
+
+  function selectFamily(nextFamily: FamilyFilter) {
+    setFamilyFilter(nextFamily);
+
+    if (nextFamily === "all") return;
+
+    const firstMatchingTarget = targetEntries.find(
+      ([, target]) => target.family === nextFamily
+    );
+    if (firstMatchingTarget) {
+      setSelectedTarget(firstMatchingTarget[0]);
+    }
   }
 
   async function setSelectedFirmware(
@@ -439,132 +337,6 @@ export default function CortexProgrammer() {
     }
   }
 
-  async function waitForFlashReady(target: CortexM) {
-    for (let attempt = 0; attempt < 500; attempt += 1) {
-      const status = await target.readMem32(STM32_FLASH_SR);
-      if ((status & STM32_FLASH_SR_BSY) === 0) {
-        if (status & (STM32_FLASH_SR_PGERR | STM32_FLASH_SR_WRPRTERR)) {
-          throw new Error(`STM32 flash error status ${formatHex32(status)}`);
-        }
-
-        return;
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, 2));
-    }
-
-    throw new Error("Timed out waiting for STM32 flash");
-  }
-
-  async function clearFlashStatus(target: CortexM) {
-    await target.writeMem32(STM32_FLASH_SR, STM32_FLASH_CLEAR_FLAGS);
-  }
-
-  async function unlockStm32Flash(target: CortexM) {
-    const control = await target.readMem32(STM32_FLASH_CR);
-    if ((control & STM32_FLASH_CR_LOCK) === 0) return;
-
-    await target.writeMem32(STM32_FLASH_KEYR, STM32_FLASH_KEY1);
-    await target.writeMem32(STM32_FLASH_KEYR, STM32_FLASH_KEY2);
-
-    const unlockedControl = await target.readMem32(STM32_FLASH_CR);
-    if (unlockedControl & STM32_FLASH_CR_LOCK) {
-      throw new Error("STM32 flash is still locked");
-    }
-  }
-
-  async function eraseStm32Pages(
-    target: CortexM,
-    startAddress: number,
-    byteLength: number,
-    pageSize: number
-  ) {
-    const eraseLength = alignUp(byteLength, pageSize);
-    const pageCount = eraseLength / pageSize;
-
-    addLog(`Erasing ${pageCount} page(s) of ${pageSize} bytes\n`);
-
-    for (let page = 0; page < pageCount; page += 1) {
-      const pageAddress = startAddress + page * pageSize;
-
-      await waitForFlashReady(target);
-      await clearFlashStatus(target);
-      await target.writeMem32(STM32_FLASH_CR, STM32_FLASH_CR_PER);
-      await target.writeMem32(STM32_FLASH_AR, pageAddress);
-      await target.writeMem32(STM32_FLASH_CR, STM32_FLASH_CR_PER | STM32_FLASH_CR_STRT);
-      await waitForFlashReady(target);
-      await target.writeMem32(STM32_FLASH_CR, 0);
-
-      const percent = Number((((page + 1) / pageCount) * 35).toFixed(1));
-      setProgress(percent);
-      addLog(`Erased page ${page + 1}/${pageCount} at ${formatHex32(pageAddress)}\n`);
-    }
-  }
-
-  async function programStm32Flash(
-    target: CortexM,
-    startAddress: number,
-    data: Uint8Array
-  ) {
-    const padded = data.length % 2 === 0
-      ? data
-      : new Uint8Array([...data, 0xff]);
-    const halfwordCount = padded.length / 2;
-
-    addLog(`Programming ${formatBytes(padded.length)} at ${formatHex32(startAddress)}\n`);
-
-    await waitForFlashReady(target);
-    await clearFlashStatus(target);
-    await target.writeMem32(STM32_FLASH_CR, STM32_FLASH_CR_PG);
-
-    for (let index = 0; index < halfwordCount; index += 1) {
-      const address = startAddress + index * 2;
-      const value = padded[index * 2] | (padded[index * 2 + 1] << 8);
-
-      await target.writeMem16(address, value);
-      await waitForFlashReady(target);
-
-      if (index % 128 === 0 || index === halfwordCount - 1) {
-        const percent = 35 + Number((((index + 1) / halfwordCount) * 45).toFixed(1));
-        setProgress(percent);
-      }
-    }
-
-    await target.writeMem32(STM32_FLASH_CR, 0);
-  }
-
-  async function verifyStm32Flash(
-    target: CortexM,
-    startAddress: number,
-    data: Uint8Array
-  ) {
-    const padded = data.length % 2 === 0
-      ? data
-      : new Uint8Array([...data, 0xff]);
-    const halfwordCount = padded.length / 2;
-
-    addLog("Verifying flash...\n");
-
-    for (let index = 0; index < halfwordCount; index += 1) {
-      const address = startAddress + index * 2;
-      const expected = padded[index * 2] | (padded[index * 2 + 1] << 8);
-      const actual = getHalfwordFromRead(address, await target.readMem16(address));
-
-      if (actual !== expected) {
-        throw new Error(
-          `Verify failed at ${formatHex32(address)}: expected 0x${expected
-            .toString(16)
-            .padStart(4, "0")}, got 0x${actual.toString(16).padStart(4, "0")}`
-        );
-      }
-
-      if (index % 256 === 0 || index === halfwordCount - 1) {
-        const percent = 80 + Number((((index + 1) / halfwordCount) * 20).toFixed(1));
-        setProgress(percent);
-      }
-    }
-  }
-
   async function requestCmsisDapTransport(): Promise<DapTransport | null> {
     const hid = getHidApi();
     const usb = getUsbApi();
@@ -676,14 +448,18 @@ export default function CortexProgrammer() {
       transport = await requestCmsisDapTransport();
       if (!transport) return;
 
-      target = new CortexM(transport);
+      const session = createCortexTarget(transport);
+      target = session.target;
       await target.connect();
+      const targetConfig = TARGETS[selectedTarget];
+      if (targetConfig.algorithm === "py32f0") {
+        await session.dap.configureTransfer(0, PY32_DAP_WAIT_RETRY, 0);
+      }
       addLog("SWD connected\n");
 
       await target.halt();
       addLog("Core halted\n");
 
-      const targetConfig = TARGETS[selectedTarget];
       const cpuid = await target.readMem32(CORTEX_CPUID_ADDRESS);
       addLog(`CPUID: ${formatHex32(cpuid)}\n`);
 
@@ -691,11 +467,24 @@ export default function CortexProgrammer() {
         const debugId = await target.readMem32(STM32_DBGMCU_IDCODE_ADDRESS);
         addLog(
           `DBGMCU_IDCODE: ${formatHex32(debugId)} ` +
-            `(dev ${formatHex32(getStm32DeviceId(debugId))}, ` +
-            `rev 0x${getStm32RevisionId(debugId).toString(16).padStart(4, "0")})\n`
+            `(dev ${formatHex32(getDebugDeviceId(debugId))}, ` +
+            `rev 0x${getDebugRevisionId(debugId).toString(16).padStart(4, "0")})\n`
         );
       } catch {
         addLog("DBGMCU_IDCODE: unavailable\n");
+      }
+
+      if (targetConfig.algorithm === "py32f0") {
+        try {
+          const py32DebugId = await target.readMem32(PY32_DBGMCU_IDCODE_ADDRESS);
+          addLog(
+            `PY32 DBGMCU_IDCODE: ${formatHex32(py32DebugId)} ` +
+              `(dev ${formatHex32(getDebugDeviceId(py32DebugId))}, ` +
+              `rev 0x${getDebugRevisionId(py32DebugId).toString(16).padStart(4, "0")})\n`
+          );
+        } catch {
+          addLog("PY32 DBGMCU_IDCODE: unavailable\n");
+        }
       }
 
       addLog(
@@ -769,49 +558,30 @@ export default function CortexProgrammer() {
       transport = await requestCmsisDapTransport();
       if (!transport) return;
 
-      target = new CortexM(transport);
+      const session = createCortexTarget(transport);
+      target = session.target;
       await target.connect();
+      if (targetConfig.algorithm === "py32f0") {
+        await session.dap.configureTransfer(0, PY32_DAP_WAIT_RETRY, 0);
+        addLog("DAP wait retry extended for PY32 flash\n");
+      }
       addLog("SWD connected\n");
 
       await target.halt();
       addLog("Core halted\n");
-
-      if ("deviceId" in targetConfig) {
-        const debugId = await target.readMem32(STM32_DBGMCU_IDCODE_ADDRESS);
-        const deviceId = getStm32DeviceId(debugId);
-        if (deviceId !== targetConfig.deviceId) {
-          throw new Error(
-            `Expected ${targetConfig.label} device id 0x${targetConfig.deviceId.toString(16)}, got 0x${deviceId.toString(16)}`
-          );
-        }
-      }
 
       addLog(
         `Target: ${targetConfig.label}, image ${firmwareImage.format.toUpperCase()} ` +
           `${formatBytes(firmwareBytes.length)} at ${formatHex32(firmwareImage.address)}\n`
       );
 
-      await unlockStm32Flash(target);
-      addLog("Flash unlocked\n");
+      const callbacks = { addLog, setProgress };
 
-      await eraseStm32Pages(
-        target,
-        firmwareImage.address,
-        firmwareBytes.length,
-        targetConfig.pageSize
-      );
-
-      await programStm32Flash(
-        target,
-        firmwareImage.address,
-        firmwareBytes
-      );
-
-      await verifyStm32Flash(
-        target,
-        firmwareImage.address,
-        firmwareBytes
-      );
+      if (targetConfig.algorithm === "py32f0") {
+        await flashPy32F0(target, firmwareImage, targetConfig, callbacks);
+      } else {
+        await flashStm32F1(target, firmwareImage, targetConfig, callbacks);
+      }
 
       setProgress(100);
       addLog("Cortex firmware flashed and verified\n");
@@ -837,11 +607,13 @@ export default function CortexProgrammer() {
   }
 
   useEffect(() => {
+    if (!showConsole) return;
+
     const logsElement = logsContainerRef.current;
     if (!logsElement) return;
 
     logsElement.scrollTop = logsElement.scrollHeight;
-  }, [logs]);
+  }, [logs, showConsole]);
 
   const busy = testing || connectingTarget || flashing;
   const selectedTargetConfig = TARGETS[selectedTarget];
@@ -879,6 +651,47 @@ export default function CortexProgrammer() {
 
         <div className="grid gap-4 p-4 lg:grid-cols-[minmax(0,1fr)_380px]">
           <div className="grid gap-4">
+            <div className="rounded-lg border border-slate-200 bg-white p-3">
+              <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_280px]">
+                <div>
+                  <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                    Familia
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+                    {FAMILY_FILTERS.map((family) => (
+                      <button
+                        className={`rounded-md border px-3 py-2 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                          familyFilter === family.id
+                            ? "border-cyan-400 bg-cyan-50 text-cyan-950"
+                            : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
+                        }`}
+                        disabled={busy}
+                        key={family.id}
+                        onClick={() => selectFamily(family.id)}
+                        type="button"
+                      >
+                        {family.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <label className="min-w-0">
+                  <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                    Buscar
+                  </div>
+                  <input
+                    className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-950 placeholder:text-slate-400"
+                    disabled={busy}
+                    onChange={(event) => setTargetSearch(event.target.value)}
+                    placeholder="py32f003, stm32, gd32..."
+                    type="search"
+                    value={targetSearch}
+                  />
+                </label>
+              </div>
+            </div>
+
             <div className="grid gap-3 md:grid-cols-3">
               <div className="rounded-lg border border-slate-200 bg-white p-3">
                 <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
@@ -886,18 +699,27 @@ export default function CortexProgrammer() {
                 </div>
                 <select
                   className="mt-2 w-full rounded-md border border-slate-300 bg-white px-2 py-2 text-sm font-semibold text-slate-950"
-                  disabled={busy}
+                  disabled={busy || filteredTargetEntries.length === 0}
                   onChange={(event) => setSelectedTarget(event.target.value as TargetKey)}
-                  value={selectedTarget}
+                  value={selectedTargetAvailable ? selectedTarget : ""}
                 >
-                  {Object.entries(TARGETS).map(([key, target]) => (
+                  {filteredTargetEntries.length === 0 ? (
+                    <option value="">Sin targets disponibles</option>
+                  ) : selectedTargetAvailable ? null : (
+                    <option value="">Selecciona un target</option>
+                  )}
+                  {filteredTargetEntries.map(([key, target]) => (
                     <option key={key} value={key}>
                       {target.label}
                     </option>
                   ))}
                 </select>
                 <div className="mt-1 text-sm text-slate-500">
-                  {selectedTargetConfig.description}
+                  {filteredTargetEntries.length === 0
+                    ? "Familia sin soporte de flash web por ahora."
+                    : selectedTargetAvailable
+                      ? selectedTargetConfig.description
+                      : "Elige un target de la lista filtrada."}
                 </div>
               </div>
 
@@ -906,10 +728,21 @@ export default function CortexProgrammer() {
                   Flash
                 </div>
                 <div className="mt-2 font-mono text-sm font-semibold text-slate-950">
-                  {formatHex32(selectedTargetConfig.flashBase)}
+                  {selectedTargetAvailable
+                    ? formatHex32(selectedTargetConfig.flashBase)
+                    : "--"}
                 </div>
                 <div className="mt-1 text-sm text-slate-500">
-                  Page size: {formatBytes(selectedTargetConfig.pageSize)}
+                  {selectedTargetAvailable ? (
+                    <>
+                      Erase: {formatBytes(selectedTargetConfig.pageSize)}
+                      {"programPageSize" in selectedTargetConfig
+                        ? `, program: ${formatBytes(selectedTargetConfig.programPageSize)}`
+                        : ""}
+                    </>
+                  ) : (
+                    "Sin target seleccionado"
+                  )}
                 </div>
               </div>
 
@@ -1007,7 +840,7 @@ export default function CortexProgrammer() {
 
               <button
                 className={`${buttonBase} border-cyan-300 bg-cyan-50 text-cyan-900 hover:bg-cyan-100`}
-                disabled={busy}
+                disabled={busy || !selectedTargetAvailable}
                 onClick={connectCortexTarget}
                 type="button"
               >
@@ -1016,7 +849,7 @@ export default function CortexProgrammer() {
 
               <button
                 className={`${buttonBase} border-slate-900 bg-slate-950 text-white hover:bg-slate-800`}
-                disabled={busy || !firmware}
+                disabled={busy || !firmware || !selectedTargetAvailable}
                 onClick={flashCortexFirmware}
                 type="button"
               >
@@ -1035,26 +868,39 @@ export default function CortexProgrammer() {
 
             <div className="mt-4 rounded-md border border-slate-200 bg-white p-3 text-sm text-slate-600">
               Raw `.bin` se escribe en <span className="font-mono">0x08000000</span>.
-              El flujo borra paginas, programa halfwords y verifica la flash.
+              El flujo usa el algoritmo configurado para el target seleccionado y verifica la flash.
             </div>
           </aside>
         </div>
 
         <div className="border-t border-slate-200 bg-slate-950 p-4">
-          <div className="mb-2 flex items-center justify-between gap-3">
-            <div className="text-sm font-semibold text-slate-200">
-              Console
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="text-sm font-semibold text-slate-200">
+                Console
+              </div>
+              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                CMSIS-DAP / SWD
+              </div>
             </div>
-            <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-              CMSIS-DAP / SWD
+
+            <button
+              className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-sm font-semibold text-slate-100 transition hover:bg-slate-800"
+              onClick={() => setShowConsole((current) => !current)}
+              type="button"
+            >
+              {showConsole ? "Ocultar consola" : "Mostrar consola"}
+            </button>
+          </div>
+
+          {showConsole ? (
+            <div
+              className="mt-3 h-[44vh] min-h-[300px] overflow-y-auto rounded-md border border-slate-800 bg-slate-900 p-3 font-mono text-sm whitespace-pre-wrap text-slate-100"
+              ref={logsContainerRef}
+            >
+              {logs || "Ready.\n"}
             </div>
-          </div>
-          <div
-            className="h-[44vh] min-h-[300px] overflow-y-auto rounded-md border border-slate-800 bg-slate-900 p-3 font-mono text-sm whitespace-pre-wrap text-slate-100"
-            ref={logsContainerRef}
-          >
-            {logs || "Ready.\n"}
-          </div>
+          ) : null}
         </div>
       </section>
     </main>

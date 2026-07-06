@@ -1,0 +1,29 @@
+{
+  "files": [],
+  "families": {
+    "esp32": {
+      "standard": [],
+      "micropython": []
+    },
+    "esp32c3": {
+      "standard": [],
+      "micropython": []
+    },
+    "esp32c5": {
+      "standard": [],
+      "micropython": []
+    },
+    "esp32c6": {
+      "standard": [],
+      "micropython": []
+    },
+    "esp32h2": {
+      "standard": [],
+      "micropython": []
+    },
+    "esp32s3": {
+      "standard": [],
+      "micropython": []
+    }
+  }
+}

@@ -1,10 +1,5 @@
 {
-  "files": [
-    "micropython_esp32c6.bin",
-    "micropython_esp32h2.bin",
-    "momo_esp32h2_bmi160.bin",
-    "momo_esp32h2_bmi270.bin"
-  ],
+  "files": [],
   "families": {
     "esp32": {
       "standard": [],
@@ -20,18 +15,11 @@
     },
     "esp32c6": {
       "standard": [],
-      "micropython": [
-        "micropython_esp32c6.bin"
-      ]
+      "micropython": []
     },
     "esp32h2": {
-      "standard": [
-        "momo_esp32h2_bmi160.bin",
-        "momo_esp32h2_bmi270.bin"
-      ],
-      "micropython": [
-        "micropython_esp32h2.bin"
-      ]
+      "standard": [],
+      "micropython": []
     },
     "esp32s3": {
       "standard": [],

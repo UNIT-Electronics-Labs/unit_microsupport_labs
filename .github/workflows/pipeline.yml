@@ -1,4 +1,4 @@
-name: Auto Build & Publish to docs/
+name: Build & Deploy to GitHub Pages
 
 on:
   push:
@@ -9,16 +9,19 @@ on:
 permissions:
   contents: write
   pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
 
 jobs:
-  build-and-publish:
+  build:
     runs-on: ubuntu-latest
     
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -41,28 +44,25 @@ jobs:
           mkdir -p docs
           cp -r esp_loader/dist/* docs/
           touch docs/.nojekyll
-          echo "Contents of docs/:"
-          ls -la docs/
 
-      - name: Commit and Push Changes
-        run: |
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global user.name "github-actions[bot]"
-          git add docs/
-          git diff --quiet && git diff --staged --quiet || (git commit -m "chore: auto-publish build artifacts" && git push origin main)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload Build Artifacts
-        uses: actions/upload-artifact@v4
+      - name: Upload Pages Artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          name: dist-${{ github.run_id }}
-          path: esp_loader/dist/
-          retention-days: 30
+          path: ./docs
 
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    
+    permissions:
+      pages: write
+      id-token: write
+    
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    
+    steps:
       - name: Deploy to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v3
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./docs
-          force_orphan: true
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -5,14 +5,12 @@ import {
   type Transport as DapTransport,
   WebUSB as DapWebUSB,
 } from "dapjs";
-import { flashPy32F0, PY32_DAP_WAIT_RETRY, PY32_DBGMCU_IDCODE_ADDRESS } from "../cortex/flash/py32f0";
+import { flashPy32F0, PY32_DAP_WAIT_RETRY } from "../cortex/flash/py32f0";
 import { parseFirmwareImage } from "../cortex/firmware";
 import { TARGETS, type TargetKey } from "../cortex/targets";
 import {
   formatBytes,
   formatHex32,
-  getDebugDeviceId,
-  getDebugRevisionId,
   getErrorMessage,
 } from "../cortex/utils";
 
@@ -25,8 +23,6 @@ const CMSIS_DAP_USB_FILTERS = [
   { vendorId: 0x2e8a },
   { vendorId: 0x303a },
 ] as const;
-
-const CORTEX_CPUID_ADDRESS = 0xe000ed00;
 
 type FamilyFilter = "py32";
 

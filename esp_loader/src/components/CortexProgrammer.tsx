@@ -608,7 +608,7 @@ export default function CortexProgrammer() {
               <a
                 className={`${buttonBase} block border-blue-600 bg-blue-600 text-center text-white hover:bg-blue-700`}
                 download="free_dap_rp2040.uf2"
-                href="/esp_flasher/firmware/free_dap_rp2040.uf2"
+                href="/firmware/free_dap_rp2040.uf2"
               >
                 Download UF2 Firmware
               </a>

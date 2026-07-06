@@ -6,6 +6,7 @@ import {
   WebUSB as DapWebUSB,
 } from "dapjs";
 import { flashPy32F0, PY32_DAP_WAIT_RETRY, PY32_DBGMCU_IDCODE_ADDRESS } from "../cortex/flash/py32f0";
+import { flashStm32F1, STM32_DBGMCU_IDCODE_ADDRESS } from "../cortex/flash/stm32f1";
 import { parseFirmwareImage } from "../cortex/firmware";
 import { TARGETS, type TargetKey } from "../cortex/targets";
 import {
@@ -15,6 +16,16 @@ import {
   getDebugRevisionId,
   getErrorMessage,
 } from "../cortex/utils";
+
+const DAP_INFO_REQUESTS = {
+  VENDOR_ID: 0x01,
+  PRODUCT_ID: 0x02,
+  SERIAL_NUMBER: 0x03,
+  CMSIS_DAP_FW_VERSION: 0x04,
+  CAPABILITIES: 0xf0,
+  PACKET_COUNT: 0xfe,
+  PACKET_SIZE: 0xff,
+} as const;
 
 const CMSIS_DAP_USB_FILTERS = [
   { vendorId: 0x0d28 },
@@ -27,6 +38,15 @@ const CMSIS_DAP_USB_FILTERS = [
 ] as const;
 
 const CORTEX_CPUID_ADDRESS = 0xe000ed00;
+
+type FamilyFilter = "all" | "stm32" | "py32" | "gd32";
+
+const FAMILY_FILTERS = [
+  { id: "all", label: "Todos" },
+  { id: "stm32", label: "STM32" },
+  { id: "py32", label: "PY32" },
+  { id: "gd32", label: "GD32" },
+] as const satisfies ReadonlyArray<{ id: FamilyFilter; label: string }>;
 
 type WebHidInputReportEvent = Event & {
   data: DataView;
@@ -45,6 +65,19 @@ type WebHidDevice = EventTarget & {
 type WebHidApi = {
   getDevices?: () => Promise<WebHidDevice[]>;
   requestDevice(options: { filters: unknown[] }): Promise<WebHidDevice[]>;
+};
+
+type FileSystemFileHandleLike = {
+  getFile(): Promise<File>;
+  queryPermission?: (descriptor?: { mode?: "read" }) => Promise<PermissionState>;
+  requestPermission?: (descriptor?: { mode?: "read" }) => Promise<PermissionState>;
+};
+
+type WindowWithFilePicker = Window & {
+  showOpenFilePicker?: (options?: {
+    excludeAcceptAllOption?: boolean;
+    multiple?: boolean;
+  }) => Promise<FileSystemFileHandleLike[]>;
 };
 
 function formatUsbId(value?: number): string {
@@ -135,18 +168,21 @@ function createCortexTarget(transport: DapTransport): {
 }
 
 export default function CortexProgrammer() {
-  const [selectedTarget, setSelectedTarget] = useState<TargetKey>("py32f003x6");
+  const [selectedTarget, setSelectedTarget] = useState<TargetKey>("stm32f103rc");
+  const [familyFilter, setFamilyFilter] = useState<FamilyFilter>("all");
+  const [targetSearch, setTargetSearch] = useState("");
   const [logs, setLogs] = useState("");
+  const [testing, setTesting] = useState(false);
   const [connectingTarget, setConnectingTarget] = useState(false);
   const [flashing, setFlashing] = useState(false);
   const [firmware, setFirmware] = useState<File | null>(null);
   const [firmwareBytes, setFirmwareBytes] = useState<Uint8Array | null>(null);
+  const [firmwareHandle, setFirmwareHandle] =
+    useState<FileSystemFileHandleLike | null>(null);
   const [firmwareName, setFirmwareName] = useState("");
   const [progress, setProgress] = useState(0);
   const [showConsole, setShowConsole] = useState(false);
   const logsContainerRef = useRef<HTMLDivElement | null>(null);
-  const activeTransportRef = useRef<DapTransport | null>(null);
-  const [isConnected, setIsConnected] = useState(false);
 
   function addLog(text: string) {
     setLogs((prev) => prev + text);
@@ -155,110 +191,67 @@ export default function CortexProgrammer() {
   const targetEntries = Object.entries(TARGETS) as Array<
     [TargetKey, (typeof TARGETS)[TargetKey]]
   >;
+  const normalizedSearch = targetSearch.trim().toLowerCase();
+  const filteredTargetEntries = targetEntries.filter(([key, target]) => {
+    const matchesFamily =
+      familyFilter === "all" || target.family === familyFilter;
+    const searchableText = `${key} ${target.label} ${target.description} ${target.family}`.toLowerCase();
+    return matchesFamily && searchableText.includes(normalizedSearch);
+  });
+  const selectedTargetAvailable = filteredTargetEntries.some(
+    ([key]) => key === selectedTarget
+  );
 
-  function isElfFile(bytes: Uint8Array): boolean {
-    return bytes.length >= 4 && 
-           bytes[0] === 0x7f && 
-           bytes[1] === 0x45 && // 'E'
-           bytes[2] === 0x4c && // 'L'
-           bytes[3] === 0x46;   // 'F'
+  function selectFamily(nextFamily: FamilyFilter) {
+    setFamilyFilter(nextFamily);
+
+    if (nextFamily === "all") return;
+
+    const firstMatchingTarget = targetEntries.find(
+      ([, target]) => target.family === nextFamily
+    );
+    if (firstMatchingTarget) {
+      setSelectedTarget(firstMatchingTarget[0]);
+    }
   }
 
-  function convertElfToBin(elfBytes: Uint8Array): Uint8Array<ArrayBuffer> {
-    // ELF32 Little-endian ARM
-    const view = new DataView(elfBytes.buffer, elfBytes.byteOffset);
-    
-    // Verify ELF class (32-bit)
-    if (elfBytes[4] !== 1) {
-      throw new Error("Only 32-bit ELF files are supported");
-    }
-    
-    // Verify little-endian
-    if (elfBytes[5] !== 1) {
-      throw new Error("Only little-endian ELF files are supported");
-    }
-
-    // Read program header table offset and entry count
-    const phOff = view.getUint32(0x1c, true);
-    const phEntSize = view.getUint16(0x2a, true);
-    const phNum = view.getUint16(0x2c, true);
-
-    if (phNum === 0) {
-      throw new Error("No program headers found in ELF file");
-    }
-
-    // Find the first LOAD segment (type = 1)
-    let minAddr = 0xffffffff;
-    let maxAddr = 0;
-    const segments: Array<{ offset: number; vaddr: number; size: number }> = [];
-
-    for (let i = 0; i < phNum; i++) {
-      const phOffset = phOff + i * phEntSize;
-      const type = view.getUint32(phOffset, true);
-      
-      if (type === 1) { // PT_LOAD
-        const offset = view.getUint32(phOffset + 4, true);
-        const vaddr = view.getUint32(phOffset + 8, true);
-        const filesz = view.getUint32(phOffset + 16, true);
-        
-        if (filesz > 0) {
-          segments.push({ offset, vaddr, size: filesz });
-          minAddr = Math.min(minAddr, vaddr);
-          maxAddr = Math.max(maxAddr, vaddr + filesz);
-        }
-      }
-    }
-
-    if (segments.length === 0) {
-      throw new Error("No loadable segments found in ELF file");
-    }
-
-    // Create binary with size = highest address - lowest address
-    const binSize = maxAddr - minAddr;
-    const binary = new Uint8Array(new ArrayBuffer(binSize));
-    binary.fill(0xff); // Fill with 0xff (flash erased state)
-
-    // Copy all segments to their relative positions
-    for (const seg of segments) {
-      const destOffset = seg.vaddr - minAddr;
-      const srcData = elfBytes.subarray(seg.offset, seg.offset + seg.size);
-      binary.set(srcData, destOffset);
-    }
-
-    return binary;
-  }
-
-  async function setSelectedFirmware(file: File | null) {
+  async function setSelectedFirmware(
+    file: File | null,
+    handle: FileSystemFileHandleLike | null
+  ) {
     setFirmware(file);
+    setFirmwareHandle(handle);
     setFirmwareName(file?.name ?? "");
     setFirmwareBytes(null);
 
     if (file) {
-      const rawBytes = new Uint8Array(await file.arrayBuffer());
-      
-      let processedBytes = rawBytes;
-      
-      // Detect and convert ELF files
-      if (isElfFile(rawBytes)) {
-        try {
-          addLog(`⚙️  Converting ELF to binary format...\n`);
-          processedBytes = convertElfToBin(rawBytes);
-          addLog(
-            `✓ Firmware converted: ${file.name} (${formatBytes(rawBytes.length)} → ${formatBytes(processedBytes.length)})\n`
-          );
-        } catch (err) {
-          addLog(`❌ ELF conversion failed: ${getErrorMessage(err)}\n`);
-          addLog(`💡 Convert manually: arm-none-eabi-objcopy -O binary ${file.name} firmware.bin\n`);
-          return;
-        }
-      } else {
-        addLog(
-          `Firmware selected: ${file.name} (${formatBytes(file.size)})\n`
-        );
+      if (!handle) {
+        setFirmwareBytes(new Uint8Array(await file.arrayBuffer()));
       }
-      
-      setFirmwareBytes(processedBytes);
+
+      addLog(
+        `Cortex firmware selected: ${file.name} (${formatBytes(file.size)})\n`
+      );
     }
+  }
+
+  async function pickFirmwareFile() {
+    const picker = (window as WindowWithFilePicker).showOpenFilePicker;
+
+    if (!picker) {
+      addLog("File picker handle API is not available; use the file input.\n");
+      return;
+    }
+
+    const [handle] = await picker({
+      excludeAcceptAllOption: false,
+      multiple: false,
+    });
+
+    if (!handle) return;
+
+    const file = await handle.getFile();
+    await setSelectedFirmware(file, handle);
   }
 
   async function askFirmwareForFlash(): Promise<{
@@ -266,8 +259,37 @@ export default function CortexProgrammer() {
     name: string;
     size: number;
   } | null> {
+    return getReadableFirmwareData();
+  }
+
+  async function getReadableFirmwareData(): Promise<{
+    bytes: Uint8Array;
+    name: string;
+    size: number;
+  }> {
+    if (firmwareHandle) {
+      const permission = await firmwareHandle.queryPermission?.({ mode: "read" });
+      if (permission === "denied") {
+        const nextPermission = await firmwareHandle.requestPermission?.({
+          mode: "read",
+        });
+        if (nextPermission === "denied") {
+          throw new Error("Permission to read the firmware file was denied");
+        }
+      }
+
+      const freshFile = await firmwareHandle.getFile();
+      setFirmware(freshFile);
+      setFirmwareName(freshFile.name);
+      return {
+        bytes: new Uint8Array(await freshFile.arrayBuffer()),
+        name: freshFile.name,
+        size: freshFile.size,
+      };
+    }
+
     if (!firmware || !firmwareBytes) {
-      throw new Error("Select a firmware file (.bin or .elf)");
+      throw new Error("Select a Cortex firmware .bin");
     }
 
     return {
@@ -291,85 +313,27 @@ export default function CortexProgrammer() {
     return (navigator as Navigator & { hid?: WebHidApi }).hid;
   }
 
-  async function disconnectCortexTarget() {
-    if (!activeTransportRef.current) return;
-    
-    addLog("\nDisconnecting CMSIS-DAP probe...\n");
-    try {
-      await activeTransportRef.current.close();
-      addLog("CMSIS-DAP disconnected\n");
-    } catch (err: unknown) {
-      addLog(`Disconnect error: ${getErrorMessage(err)}\n`);
-    } finally {
-      activeTransportRef.current = null;
-      setIsConnected(false);
-    }
-  }
+  async function readCmsisDapInfo(transport: DapTransport) {
+    await transport.open();
 
-  async function connectCortexTarget() {
-    setConnectingTarget(true);
-    addLog("\nConnecting to Cortex target over SWD...\n");
+    const dap = new CmsisDAP(transport);
+    const infoRequests = [
+      ["Vendor", DAP_INFO_REQUESTS.VENDOR_ID],
+      ["Product", DAP_INFO_REQUESTS.PRODUCT_ID],
+      ["Serial", DAP_INFO_REQUESTS.SERIAL_NUMBER],
+      ["CMSIS-DAP FW", DAP_INFO_REQUESTS.CMSIS_DAP_FW_VERSION],
+      ["Packet count", DAP_INFO_REQUESTS.PACKET_COUNT],
+      ["Packet size", DAP_INFO_REQUESTS.PACKET_SIZE],
+      ["Capabilities", DAP_INFO_REQUESTS.CAPABILITIES],
+    ] as const;
 
-    let transport: DapTransport | null = null;
-    let target: CortexM | null = null;
-
-    try {
-      transport = await requestCmsisDapTransport();
-      if (!transport) return;
-
-      const session = createCortexTarget(transport);
-      target = session.target;
-      await target.connect();
-      const targetConfig = TARGETS[selectedTarget];
-      await session.dap.configureTransfer(0, PY32_DAP_WAIT_RETRY, 0);
-      addLog("SWD connected\n");
-
-      await target.halt();
-      addLog("Core halted\n");
-
-      const cpuid = await target.readMem32(CORTEX_CPUID_ADDRESS);
-      addLog(`CPUID: ${formatHex32(cpuid)}\n`);
-
+    for (const [label, request] of infoRequests) {
       try {
-        const py32DebugId = await target.readMem32(PY32_DBGMCU_IDCODE_ADDRESS);
-        addLog(
-          `PY32 DBGMCU_IDCODE: ${formatHex32(py32DebugId)} ` +
-            `(dev ${formatHex32(getDebugDeviceId(py32DebugId))}, ` +
-            `rev 0x${getDebugRevisionId(py32DebugId).toString(16).padStart(4, "0")})\n`
-        );
-      } catch {
-        addLog("PY32 DBGMCU_IDCODE: unavailable\n");
+        const value = await dap.dapInfo(request);
+        addLog(`${label}: ${value}\n`);
+      } catch (err: unknown) {
+        addLog(`${label}: unavailable (${getErrorMessage(err)})\n`);
       }
-
-      addLog(
-        `Configured target flash: ${formatBytes(targetConfig.flashSizeBytes)} ` +
-          `at ${formatHex32(targetConfig.flashBase)}\n`
-      );
-
-      await target.resume(false);
-      addLog("Core resumed\n");
-      addLog("Cortex target probe finished\n");
-      
-      // Guardar el transport para reutilizarlo
-      activeTransportRef.current = transport;
-      setIsConnected(true);
-    } catch (err: unknown) {
-      console.error(err);
-      addLog(`Cortex target error: ${getErrorMessage(err)}\n`);
-      // Cerrar transport si hubo error
-      try {
-        await target?.disconnect();
-      } catch {
-        try {
-          await transport?.close();
-        } catch {
-          // Already closed or unavailable.
-        }
-      }
-      activeTransportRef.current = null;
-      setIsConnected(false);
-    } finally {
-      setConnectingTarget(false);
     }
   }
 
@@ -383,9 +347,19 @@ export default function CortexProgrammer() {
     }
 
     if (hid) {
-      addLog("Using WebHID. Select the CMSIS-DAP probe.\n");
-      const devices = await hid.requestDevice({ filters: [] });
-      const device = devices[0] ?? null;
+      const rememberedDevices = (await hid.getDevices?.()) ?? [];
+      let device =
+        rememberedDevices.find((currentDevice) =>
+          looksLikeCmsisDapDevice(currentDevice)
+        ) ?? null;
+
+      if (device) {
+        addLog("Using remembered WebHID CMSIS-DAP probe.\n");
+      } else {
+        addLog("Using WebHID. Select the UnitElectronics CMSIS-DAP probe.\n");
+        const devices = await hid.requestDevice({ filters: [] });
+        device = devices[0] ?? null;
+      }
 
       if (!device) {
         addLog("No HID device selected\n");
@@ -436,6 +410,109 @@ export default function CortexProgrammer() {
     return new DapWebUSB(device as ConstructorParameters<typeof DapWebUSB>[0]);
   }
 
+  async function testCmsisDap() {
+    setTesting(true);
+    addLog("\nSearching Cortex CMSIS-DAP probe...\n");
+
+    let transport: DapTransport | null = null;
+
+    try {
+      transport = await requestCmsisDapTransport();
+      if (transport) {
+        await readCmsisDapInfo(transport);
+      }
+
+      addLog("CMSIS-DAP probe test finished\n");
+    } catch (err: unknown) {
+      console.error(err);
+      addLog(`CMSIS-DAP Error: ${getErrorMessage(err)}\n`);
+    } finally {
+      try {
+        await transport?.close();
+      } catch {
+        // Already closed or unavailable.
+      }
+
+      setTesting(false);
+    }
+  }
+
+  async function connectCortexTarget() {
+    setConnectingTarget(true);
+    addLog("\nConnecting to Cortex target over SWD...\n");
+
+    let transport: DapTransport | null = null;
+    let target: CortexM | null = null;
+
+    try {
+      transport = await requestCmsisDapTransport();
+      if (!transport) return;
+
+      const session = createCortexTarget(transport);
+      target = session.target;
+      await target.connect();
+      const targetConfig = TARGETS[selectedTarget];
+      if (targetConfig.algorithm === "py32f0") {
+        await session.dap.configureTransfer(0, PY32_DAP_WAIT_RETRY, 0);
+      }
+      addLog("SWD connected\n");
+
+      await target.halt();
+      addLog("Core halted\n");
+
+      const cpuid = await target.readMem32(CORTEX_CPUID_ADDRESS);
+      addLog(`CPUID: ${formatHex32(cpuid)}\n`);
+
+      try {
+        const debugId = await target.readMem32(STM32_DBGMCU_IDCODE_ADDRESS);
+        addLog(
+          `DBGMCU_IDCODE: ${formatHex32(debugId)} ` +
+            `(dev ${formatHex32(getDebugDeviceId(debugId))}, ` +
+            `rev 0x${getDebugRevisionId(debugId).toString(16).padStart(4, "0")})\n`
+        );
+      } catch {
+        addLog("DBGMCU_IDCODE: unavailable\n");
+      }
+
+      if (targetConfig.algorithm === "py32f0") {
+        try {
+          const py32DebugId = await target.readMem32(PY32_DBGMCU_IDCODE_ADDRESS);
+          addLog(
+            `PY32 DBGMCU_IDCODE: ${formatHex32(py32DebugId)} ` +
+              `(dev ${formatHex32(getDebugDeviceId(py32DebugId))}, ` +
+              `rev 0x${getDebugRevisionId(py32DebugId).toString(16).padStart(4, "0")})\n`
+          );
+        } catch {
+          addLog("PY32 DBGMCU_IDCODE: unavailable\n");
+        }
+      }
+
+      addLog(
+        `Configured target flash: ${formatBytes(targetConfig.flashSizeBytes)} ` +
+          `at ${formatHex32(targetConfig.flashBase)}\n`
+      );
+
+      await target.resume(false);
+      addLog("Core resumed\n");
+      addLog("Cortex target probe finished\n");
+    } catch (err: unknown) {
+      console.error(err);
+      addLog(`Cortex target error: ${getErrorMessage(err)}\n`);
+    } finally {
+      try {
+        await target?.disconnect();
+      } catch {
+        try {
+          await transport?.close();
+        } catch {
+          // Already closed or unavailable.
+        }
+      }
+
+      setConnectingTarget(false);
+    }
+  }
+
   async function flashCortexFirmware() {
     let selectedFirmware: {
       bytes: Uint8Array;
@@ -478,22 +555,16 @@ export default function CortexProgrammer() {
         );
       }
 
-      // Usar el transport guardado si ya está conectado, si no, pedir seleccionar
-      if (activeTransportRef.current) {
-        transport = activeTransportRef.current;
-        addLog("Using already connected CMSIS-DAP probe\n");
-      } else {
-        transport = await requestCmsisDapTransport();
-        if (!transport) return;
-        activeTransportRef.current = transport;
-        setIsConnected(true);
-      }
+      transport = await requestCmsisDapTransport();
+      if (!transport) return;
 
       const session = createCortexTarget(transport);
       target = session.target;
       await target.connect();
-      await session.dap.configureTransfer(0, PY32_DAP_WAIT_RETRY, 0);
-      addLog("DAP wait retry extended for PY32 flash\n");
+      if (targetConfig.algorithm === "py32f0") {
+        await session.dap.configureTransfer(0, PY32_DAP_WAIT_RETRY, 0);
+        addLog("DAP wait retry extended for PY32 flash\n");
+      }
       addLog("SWD connected\n");
 
       await target.halt();
@@ -506,7 +577,11 @@ export default function CortexProgrammer() {
 
       const callbacks = { addLog, setProgress };
 
-      await flashPy32F0(target, firmwareImage, targetConfig, callbacks);
+      if (targetConfig.algorithm === "py32f0") {
+        await flashPy32F0(target, firmwareImage, targetConfig, callbacks);
+      } else {
+        await flashStm32F1(target, firmwareImage, targetConfig, callbacks);
+      }
 
       setProgress(100);
       addLog("Cortex firmware flashed and verified\n");
@@ -516,26 +591,17 @@ export default function CortexProgrammer() {
     } catch (err: unknown) {
       console.error(err);
       addLog(`Flash Cortex error: ${getErrorMessage(err)}\n`);
-      // Si hay error, cerrar todo y limpiar la conexión guardada
-      try {
-        await target?.disconnect();
-      } catch {
-        // Ignorar errores al desconectar
-      }
-      try {
-        await transport?.close();
-      } catch {
-        // Ignorar errores al cerrar
-      }
-      activeTransportRef.current = null;
-      setIsConnected(false);
     } finally {
-      // Solo desconectar el target pero mantener el transport abierto
       try {
         await target?.disconnect();
       } catch {
-        // Ignorar errores al desconectar
+        try {
+          await transport?.close();
+        } catch {
+          // Already closed or unavailable.
+        }
       }
+
       setFlashing(false);
     }
   }
@@ -549,20 +615,19 @@ export default function CortexProgrammer() {
     logsElement.scrollTop = logsElement.scrollHeight;
   }, [logs, showConsole]);
 
-  const busy = connectingTarget || flashing;
+  const busy = testing || connectingTarget || flashing;
+  const selectedTargetConfig = TARGETS[selectedTarget];
   const firmwareSize = firmware ? formatBytes(firmware.size) : "No file";
   const statusLabel = flashing
     ? "Programming"
     : connectingTarget
       ? "Connecting"
-      : isConnected
-        ? "Connected"
+      : testing
+        ? "Testing"
         : "Ready";
   const statusClass = busy
     ? "border-amber-300 bg-amber-50 text-amber-800"
-    : isConnected
-      ? "border-cyan-300 bg-cyan-50 text-cyan-800"
-      : "border-emerald-300 bg-emerald-50 text-emerald-800";
+    : "border-emerald-300 bg-emerald-50 text-emerald-800";
   const buttonBase =
     "rounded-md border px-3 py-2 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-50";
 
@@ -572,10 +637,10 @@ export default function CortexProgrammer() {
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 bg-slate-50 px-4 py-3">
           <div>
             <h1 className="text-lg font-semibold text-slate-950">
-              LockNode Programmer
+              Programador Cortex
             </h1>
             <p className="text-sm text-slate-500">
-              PY32F003 via CMSIS-DAP
+              ARM Cortex por CMSIS-DAP sobre WebHID.
             </p>
           </div>
 
@@ -586,58 +651,162 @@ export default function CortexProgrammer() {
 
         <div className="grid gap-4 p-4 lg:grid-cols-[minmax(0,1fr)_380px]">
           <div className="grid gap-4">
-            <div className="rounded-lg border border-slate-200 bg-white p-4">
-              <div className="mb-3 text-sm font-semibold text-slate-900">
-                Target Chip
-              </div>
-              <select
-                className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-950"
-                disabled={busy}
-                onChange={(event) => setSelectedTarget(event.target.value as TargetKey)}
-                value={selectedTarget}
-              >
-                {targetEntries.map(([key, target]) => (
-                  <option key={key} value={key}>
-                    {target.label} — {target.description}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div className="rounded-lg border border-slate-200 bg-white p-4">
-              <div className="mb-3 text-sm font-semibold text-slate-900">
-                Firmware File
-              </div>
-              <input
-                accept=".bin,.elf"
-                className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 file:mr-3 file:rounded-md file:border-0 file:bg-slate-900 file:px-4 file:py-2 file:text-sm file:font-semibold file:text-white hover:file:bg-slate-800"
-                disabled={busy}
-                onClick={(event) => {
-                  event.currentTarget.value = "";
-                }}
-                onChange={(event) => {
-                  const selectedFirmware = event.target.files?.[0] ?? null;
-                  void setSelectedFirmware(selectedFirmware).catch(
-                    (err: unknown) => {
-                      addLog(
-                        `Firmware read error: ${getErrorMessage(err)}\n`
-                      );
-                    }
-                  );
-                }}
-                type="file"
-
-              />
-              {firmwareName && (
-                <div className="mt-2 text-sm text-slate-600">
-                  <span className="font-semibold">{firmwareName}</span> • {firmwareSize}
+            <div className="rounded-lg border border-slate-200 bg-white p-3">
+              <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_280px]">
+                <div>
+                  <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                    Familia
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+                    {FAMILY_FILTERS.map((family) => (
+                      <button
+                        className={`rounded-md border px-3 py-2 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                          familyFilter === family.id
+                            ? "border-cyan-400 bg-cyan-50 text-cyan-950"
+                            : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
+                        }`}
+                        disabled={busy}
+                        key={family.id}
+                        onClick={() => selectFamily(family.id)}
+                        type="button"
+                      >
+                        {family.label}
+                      </button>
+                    ))}
+                  </div>
                 </div>
-              )}
-            </div>
-          </div>
 
-          <aside className="rounded-lg border border-slate-200 bg-slate-50 p-4">
-            <div className="mb-3 rounded-md border border-slate-200 bg-white p-3">
+                <label className="min-w-0">
+                  <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                    Buscar
+                  </div>
+                  <input
+                    className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-950 placeholder:text-slate-400"
+                    disabled={busy}
+                    onChange={(event) => setTargetSearch(event.target.value)}
+                    placeholder="py32f003, stm32, gd32..."
+                    type="search"
+                    value={targetSearch}
+                  />
+                </label>
+              </div>
+            </div>
+
+            <div className="grid gap-3 md:grid-cols-3">
+              <div className="rounded-lg border border-slate-200 bg-white p-3">
+                <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                  Target
+                </div>
+                <select
+                  className="mt-2 w-full rounded-md border border-slate-300 bg-white px-2 py-2 text-sm font-semibold text-slate-950"
+                  disabled={busy || filteredTargetEntries.length === 0}
+                  onChange={(event) => setSelectedTarget(event.target.value as TargetKey)}
+                  value={selectedTargetAvailable ? selectedTarget : ""}
+                >
+                  {filteredTargetEntries.length === 0 ? (
+                    <option value="">Sin targets disponibles</option>
+                  ) : selectedTargetAvailable ? null : (
+                    <option value="">Selecciona un target</option>
+                  )}
+                  {filteredTargetEntries.map(([key, target]) => (
+                    <option key={key} value={key}>
+                      {target.label}
+                    </option>
+                  ))}
+                </select>
+                <div className="mt-1 text-sm text-slate-500">
+                  {filteredTargetEntries.length === 0
+                    ? "Familia sin soporte de flash web por ahora."
+                    : selectedTargetAvailable
+                      ? selectedTargetConfig.description
+                      : "Elige un target de la lista filtrada."}
+                </div>
+              </div>
+
+              <div className="rounded-lg border border-slate-200 bg-white p-3">
+                <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                  Flash
+                </div>
+                <div className="mt-2 font-mono text-sm font-semibold text-slate-950">
+                  {selectedTargetAvailable
+                    ? formatHex32(selectedTargetConfig.flashBase)
+                    : "--"}
+                </div>
+                <div className="mt-1 text-sm text-slate-500">
+                  {selectedTargetAvailable ? (
+                    <>
+                      Erase: {formatBytes(selectedTargetConfig.pageSize)}
+                      {"programPageSize" in selectedTargetConfig
+                        ? `, program: ${formatBytes(selectedTargetConfig.programPageSize)}`
+                        : ""}
+                    </>
+                  ) : (
+                    "Sin target seleccionado"
+                  )}
+                </div>
+              </div>
+
+              <div className="rounded-lg border border-slate-200 bg-white p-3">
+                <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                  Firmware
+                </div>
+                <div className="mt-2 truncate text-sm font-semibold text-slate-950">
+                  {firmwareName || "No firmware selected"}
+                </div>
+                <div className="mt-1 text-sm text-slate-500">{firmwareSize}</div>
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+              <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                Firmware binary / ELF
+              </div>
+              <div className="grid gap-2 sm:grid-cols-[auto_minmax(0,1fr)]">
+                <button
+                  className="rounded-md border border-slate-900 bg-slate-950 px-3 py-2 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+                  disabled={busy}
+                  onClick={() => {
+                    void pickFirmwareFile();
+                  }}
+                  type="button"
+                >
+                  Select tracked firmware
+                </button>
+
+                <label className="min-w-0">
+                  <input
+                    accept=".bin,.elf"
+                    className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 file:mr-3 file:rounded-md file:border-0 file:bg-slate-200 file:px-3 file:py-2 file:text-sm file:font-semibold file:text-slate-800 hover:file:bg-slate-300"
+                    disabled={busy}
+                    onClick={(event) => {
+                      event.currentTarget.value = "";
+                    }}
+                    onChange={(event) => {
+                      const selectedFirmware = event.target.files?.[0] ?? null;
+                      void setSelectedFirmware(selectedFirmware, null).catch(
+                        (err: unknown) => {
+                          addLog(
+                            `Firmware read error: ${getErrorMessage(err)}\n`
+                          );
+                        }
+                      );
+                    }}
+                    type="file"
+                  />
+                </label>
+              </div>
+              <div className="mt-2 rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700">
+                Selected:{" "}
+                <span className="font-semibold text-slate-950">
+                  {firmwareName || "none"}
+                </span>
+              </div>
+              <div className="mt-2 text-xs text-slate-500">
+                Select tracked mantiene el archivo para leerlo fresco en cada flash.
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-slate-200 bg-white p-3">
               <div className="mb-2 flex items-center justify-between gap-3">
                 <div className="text-sm font-semibold text-slate-800">
                   Progress
@@ -653,35 +822,38 @@ export default function CortexProgrammer() {
                 />
               </div>
             </div>
+          </div>
 
+          <aside className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+            <div className="mb-3 text-sm font-semibold text-slate-900">
+              Actions
+            </div>
             <div className="grid gap-2">
               <button
+                className={`${buttonBase} border-slate-300 bg-white text-slate-800 hover:bg-slate-100`}
+                disabled={busy}
+                onClick={testCmsisDap}
+                type="button"
+              >
+                {testing ? "Testing CMSIS-DAP..." : "Test CMSIS-DAP"}
+              </button>
+
+              <button
                 className={`${buttonBase} border-cyan-300 bg-cyan-50 text-cyan-900 hover:bg-cyan-100`}
-                disabled={busy || isConnected}
+                disabled={busy || !selectedTargetAvailable}
                 onClick={connectCortexTarget}
                 type="button"
               >
-                {connectingTarget ? "Connecting..." : isConnected ? "✓ Connected" : "Connect"}
+                {connectingTarget ? "Connecting target..." : "Connect Cortex"}
               </button>
-
-              {isConnected && (
-                <button
-                  className={`${buttonBase} border-red-300 bg-red-50 text-red-900 hover:bg-red-100`}
-                  disabled={busy}
-                  onClick={disconnectCortexTarget}
-                  type="button"
-                >
-                  Disconnect
-                </button>
-              )}
 
               <button
                 className={`${buttonBase} border-slate-900 bg-slate-950 text-white hover:bg-slate-800`}
-                disabled={busy || !firmware}
+                disabled={busy || !firmware || !selectedTargetAvailable}
                 onClick={flashCortexFirmware}
                 type="button"
               >
-                {flashing ? "Programming..." : "Flash Firmware"}
+                {flashing ? "Flashing Cortex..." : "Flash Cortex"}
               </button>
 
               <button
@@ -690,32 +862,26 @@ export default function CortexProgrammer() {
                 onClick={() => setLogs("")}
                 type="button"
               >
-                Clear Log
+                Clear log
               </button>
             </div>
 
-            <div className="mt-4 rounded-md border border-blue-200 bg-blue-50 p-3">
-              <div className="mb-2 text-xs font-semibold text-blue-900">
-                CMSIS-DAP Firmware for RP2040
-              </div>
-              <a
-                className={`${buttonBase} block border-blue-600 bg-blue-600 text-center text-white hover:bg-blue-700`}
-                download="free_dap_rp2040.uf2"
-                href="./firmware/free_dap_rp2040.uf2"
-              >
-                Download UF2 Firmware
-              </a>
-              <div className="mt-2 text-xs text-blue-600">
-                Flash to RP2040: Hold BOOTSEL, connect USB, drag & drop UF2
-              </div>
+            <div className="mt-4 rounded-md border border-slate-200 bg-white p-3 text-sm text-slate-600">
+              Raw `.bin` se escribe en <span className="font-mono">0x08000000</span>.
+              El flujo usa el algoritmo configurado para el target seleccionado y verifica la flash.
             </div>
           </aside>
         </div>
 
         <div className="border-t border-slate-200 bg-slate-950 p-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="text-sm font-semibold text-slate-200">
-              Console
+            <div>
+              <div className="text-sm font-semibold text-slate-200">
+                Console
+              </div>
+              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                CMSIS-DAP / SWD
+              </div>
             </div>
 
             <button

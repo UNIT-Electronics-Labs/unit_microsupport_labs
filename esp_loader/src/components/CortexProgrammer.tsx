@@ -156,16 +156,108 @@ export default function CortexProgrammer() {
     [TargetKey, (typeof TARGETS)[TargetKey]]
   >;
 
+  function isElfFile(bytes: Uint8Array): boolean {
+    return bytes.length >= 4 && 
+           bytes[0] === 0x7f && 
+           bytes[1] === 0x45 && // 'E'
+           bytes[2] === 0x4c && // 'L'
+           bytes[3] === 0x46;   // 'F'
+  }
+
+  function convertElfToBin(elfBytes: Uint8Array): Uint8Array<ArrayBuffer> {
+    // ELF32 Little-endian ARM
+    const view = new DataView(elfBytes.buffer, elfBytes.byteOffset);
+    
+    // Verify ELF class (32-bit)
+    if (elfBytes[4] !== 1) {
+      throw new Error("Only 32-bit ELF files are supported");
+    }
+    
+    // Verify little-endian
+    if (elfBytes[5] !== 1) {
+      throw new Error("Only little-endian ELF files are supported");
+    }
+
+    // Read program header table offset and entry count
+    const phOff = view.getUint32(0x1c, true);
+    const phEntSize = view.getUint16(0x2a, true);
+    const phNum = view.getUint16(0x2c, true);
+
+    if (phNum === 0) {
+      throw new Error("No program headers found in ELF file");
+    }
+
+    // Find the first LOAD segment (type = 1)
+    let minAddr = 0xffffffff;
+    let maxAddr = 0;
+    const segments: Array<{ offset: number; vaddr: number; size: number }> = [];
+
+    for (let i = 0; i < phNum; i++) {
+      const phOffset = phOff + i * phEntSize;
+      const type = view.getUint32(phOffset, true);
+      
+      if (type === 1) { // PT_LOAD
+        const offset = view.getUint32(phOffset + 4, true);
+        const vaddr = view.getUint32(phOffset + 8, true);
+        const filesz = view.getUint32(phOffset + 16, true);
+        
+        if (filesz > 0) {
+          segments.push({ offset, vaddr, size: filesz });
+          minAddr = Math.min(minAddr, vaddr);
+          maxAddr = Math.max(maxAddr, vaddr + filesz);
+        }
+      }
+    }
+
+    if (segments.length === 0) {
+      throw new Error("No loadable segments found in ELF file");
+    }
+
+    // Create binary with size = highest address - lowest address
+    const binSize = maxAddr - minAddr;
+    const binary = new Uint8Array(new ArrayBuffer(binSize));
+    binary.fill(0xff); // Fill with 0xff (flash erased state)
+
+    // Copy all segments to their relative positions
+    for (const seg of segments) {
+      const destOffset = seg.vaddr - minAddr;
+      const srcData = elfBytes.subarray(seg.offset, seg.offset + seg.size);
+      binary.set(srcData, destOffset);
+    }
+
+    return binary;
+  }
+
   async function setSelectedFirmware(file: File | null) {
     setFirmware(file);
     setFirmwareName(file?.name ?? "");
     setFirmwareBytes(null);
 
     if (file) {
-      setFirmwareBytes(new Uint8Array(await file.arrayBuffer()));
-      addLog(
-        `Firmware selected: ${file.name} (${formatBytes(file.size)})\n`
-      );
+      const rawBytes = new Uint8Array(await file.arrayBuffer());
+      
+      let processedBytes = rawBytes;
+      
+      // Detect and convert ELF files
+      if (isElfFile(rawBytes)) {
+        try {
+          addLog(`⚙️  Converting ELF to binary format...\n`);
+          processedBytes = convertElfToBin(rawBytes);
+          addLog(
+            `✓ Firmware converted: ${file.name} (${formatBytes(rawBytes.length)} → ${formatBytes(processedBytes.length)})\n`
+          );
+        } catch (err) {
+          addLog(`❌ ELF conversion failed: ${getErrorMessage(err)}\n`);
+          addLog(`💡 Convert manually: arm-none-eabi-objcopy -O binary ${file.name} firmware.bin\n`);
+          return;
+        }
+      } else {
+        addLog(
+          `Firmware selected: ${file.name} (${formatBytes(file.size)})\n`
+        );
+      }
+      
+      setFirmwareBytes(processedBytes);
     }
   }
 
@@ -175,7 +267,7 @@ export default function CortexProgrammer() {
     size: number;
   } | null> {
     if (!firmware || !firmwareBytes) {
-      throw new Error("Select a firmware .bin file");
+      throw new Error("Select a firmware file (.bin or .elf)");
     }
 
     return {
@@ -534,6 +626,7 @@ export default function CortexProgrammer() {
                   );
                 }}
                 type="file"
+
               />
               {firmwareName && (
                 <div className="mt-2 text-sm text-slate-600">

@@ -6,7 +6,6 @@ import {
   WebUSB as DapWebUSB,
 } from "dapjs";
 import { flashPy32F0, PY32_DAP_WAIT_RETRY, PY32_DBGMCU_IDCODE_ADDRESS } from "../cortex/flash/py32f0";
-import { flashStm32F1, STM32_DBGMCU_IDCODE_ADDRESS } from "../cortex/flash/stm32f1";
 import { parseFirmwareImage } from "../cortex/firmware";
 import { TARGETS, type TargetKey } from "../cortex/targets";
 import {
@@ -16,16 +15,6 @@ import {
   getDebugRevisionId,
   getErrorMessage,
 } from "../cortex/utils";
-
-const DAP_INFO_REQUESTS = {
-  VENDOR_ID: 0x01,
-  PRODUCT_ID: 0x02,
-  SERIAL_NUMBER: 0x03,
-  CMSIS_DAP_FW_VERSION: 0x04,
-  CAPABILITIES: 0xf0,
-  PACKET_COUNT: 0xfe,
-  PACKET_SIZE: 0xff,
-} as const;
 
 const CMSIS_DAP_USB_FILTERS = [
   { vendorId: 0x0d28 },
@@ -39,13 +28,10 @@ const CMSIS_DAP_USB_FILTERS = [
 
 const CORTEX_CPUID_ADDRESS = 0xe000ed00;
 
-type FamilyFilter = "all" | "stm32" | "py32" | "gd32";
+type FamilyFilter = "py32";
 
 const FAMILY_FILTERS = [
-  { id: "all", label: "Todos" },
-  { id: "stm32", label: "STM32" },
-  { id: "py32", label: "PY32" },
-  { id: "gd32", label: "GD32" },
+  { id: "py32", label: "PY32F003" },
 ] as const satisfies ReadonlyArray<{ id: FamilyFilter; label: string }>;
 
 type WebHidInputReportEvent = Event & {
@@ -168,12 +154,10 @@ function createCortexTarget(transport: DapTransport): {
 }
 
 export default function CortexProgrammer() {
-  const [selectedTarget, setSelectedTarget] = useState<TargetKey>("stm32f103rc");
-  const [familyFilter, setFamilyFilter] = useState<FamilyFilter>("all");
+  const [selectedTarget, setSelectedTarget] = useState<TargetKey>("py32f003x6");
+  const [familyFilter, setFamilyFilter] = useState<FamilyFilter>("py32");
   const [targetSearch, setTargetSearch] = useState("");
   const [logs, setLogs] = useState("");
-  const [testing, setTesting] = useState(false);
-  const [connectingTarget, setConnectingTarget] = useState(false);
   const [flashing, setFlashing] = useState(false);
   const [firmware, setFirmware] = useState<File | null>(null);
   const [firmwareBytes, setFirmwareBytes] = useState<Uint8Array | null>(null);
@@ -193,10 +177,8 @@ export default function CortexProgrammer() {
   >;
   const normalizedSearch = targetSearch.trim().toLowerCase();
   const filteredTargetEntries = targetEntries.filter(([key, target]) => {
-    const matchesFamily =
-      familyFilter === "all" || target.family === familyFilter;
     const searchableText = `${key} ${target.label} ${target.description} ${target.family}`.toLowerCase();
-    return matchesFamily && searchableText.includes(normalizedSearch);
+    return searchableText.includes(normalizedSearch);
   });
   const selectedTargetAvailable = filteredTargetEntries.some(
     ([key]) => key === selectedTarget
@@ -204,8 +186,6 @@ export default function CortexProgrammer() {
 
   function selectFamily(nextFamily: FamilyFilter) {
     setFamilyFilter(nextFamily);
-
-    if (nextFamily === "all") return;
 
     const firstMatchingTarget = targetEntries.find(
       ([, target]) => target.family === nextFamily
@@ -313,30 +293,6 @@ export default function CortexProgrammer() {
     return (navigator as Navigator & { hid?: WebHidApi }).hid;
   }
 
-  async function readCmsisDapInfo(transport: DapTransport) {
-    await transport.open();
-
-    const dap = new CmsisDAP(transport);
-    const infoRequests = [
-      ["Vendor", DAP_INFO_REQUESTS.VENDOR_ID],
-      ["Product", DAP_INFO_REQUESTS.PRODUCT_ID],
-      ["Serial", DAP_INFO_REQUESTS.SERIAL_NUMBER],
-      ["CMSIS-DAP FW", DAP_INFO_REQUESTS.CMSIS_DAP_FW_VERSION],
-      ["Packet count", DAP_INFO_REQUESTS.PACKET_COUNT],
-      ["Packet size", DAP_INFO_REQUESTS.PACKET_SIZE],
-      ["Capabilities", DAP_INFO_REQUESTS.CAPABILITIES],
-    ] as const;
-
-    for (const [label, request] of infoRequests) {
-      try {
-        const value = await dap.dapInfo(request);
-        addLog(`${label}: ${value}\n`);
-      } catch (err: unknown) {
-        addLog(`${label}: unavailable (${getErrorMessage(err)})\n`);
-      }
-    }
-  }
-
   async function requestCmsisDapTransport(): Promise<DapTransport | null> {
     const hid = getHidApi();
     const usb = getUsbApi();
@@ -410,109 +366,6 @@ export default function CortexProgrammer() {
     return new DapWebUSB(device as ConstructorParameters<typeof DapWebUSB>[0]);
   }
 
-  async function testCmsisDap() {
-    setTesting(true);
-    addLog("\nSearching Cortex CMSIS-DAP probe...\n");
-
-    let transport: DapTransport | null = null;
-
-    try {
-      transport = await requestCmsisDapTransport();
-      if (transport) {
-        await readCmsisDapInfo(transport);
-      }
-
-      addLog("CMSIS-DAP probe test finished\n");
-    } catch (err: unknown) {
-      console.error(err);
-      addLog(`CMSIS-DAP Error: ${getErrorMessage(err)}\n`);
-    } finally {
-      try {
-        await transport?.close();
-      } catch {
-        // Already closed or unavailable.
-      }
-
-      setTesting(false);
-    }
-  }
-
-  async function connectCortexTarget() {
-    setConnectingTarget(true);
-    addLog("\nConnecting to Cortex target over SWD...\n");
-
-    let transport: DapTransport | null = null;
-    let target: CortexM | null = null;
-
-    try {
-      transport = await requestCmsisDapTransport();
-      if (!transport) return;
-
-      const session = createCortexTarget(transport);
-      target = session.target;
-      await target.connect();
-      const targetConfig = TARGETS[selectedTarget];
-      if (targetConfig.algorithm === "py32f0") {
-        await session.dap.configureTransfer(0, PY32_DAP_WAIT_RETRY, 0);
-      }
-      addLog("SWD connected\n");
-
-      await target.halt();
-      addLog("Core halted\n");
-
-      const cpuid = await target.readMem32(CORTEX_CPUID_ADDRESS);
-      addLog(`CPUID: ${formatHex32(cpuid)}\n`);
-
-      try {
-        const debugId = await target.readMem32(STM32_DBGMCU_IDCODE_ADDRESS);
-        addLog(
-          `DBGMCU_IDCODE: ${formatHex32(debugId)} ` +
-            `(dev ${formatHex32(getDebugDeviceId(debugId))}, ` +
-            `rev 0x${getDebugRevisionId(debugId).toString(16).padStart(4, "0")})\n`
-        );
-      } catch {
-        addLog("DBGMCU_IDCODE: unavailable\n");
-      }
-
-      if (targetConfig.algorithm === "py32f0") {
-        try {
-          const py32DebugId = await target.readMem32(PY32_DBGMCU_IDCODE_ADDRESS);
-          addLog(
-            `PY32 DBGMCU_IDCODE: ${formatHex32(py32DebugId)} ` +
-              `(dev ${formatHex32(getDebugDeviceId(py32DebugId))}, ` +
-              `rev 0x${getDebugRevisionId(py32DebugId).toString(16).padStart(4, "0")})\n`
-          );
-        } catch {
-          addLog("PY32 DBGMCU_IDCODE: unavailable\n");
-        }
-      }
-
-      addLog(
-        `Configured target flash: ${formatBytes(targetConfig.flashSizeBytes)} ` +
-          `at ${formatHex32(targetConfig.flashBase)}\n`
-      );
-
-      await target.resume(false);
-      addLog("Core resumed\n");
-      addLog("Cortex target probe finished\n");
-    } catch (err: unknown) {
-      console.error(err);
-      addLog(`Cortex target error: ${getErrorMessage(err)}\n`);
-    } finally {
-      try {
-        await target?.disconnect();
-      } catch {
-        try {
-          await transport?.close();
-        } catch {
-          // Already closed or unavailable.
-        }
-      }
-
-      setConnectingTarget(false);
-    }
-  }
-
   async function flashCortexFirmware() {
     let selectedFirmware: {
       bytes: Uint8Array;
@@ -561,10 +414,8 @@ export default function CortexProgrammer() {
       const session = createCortexTarget(transport);
       target = session.target;
       await target.connect();
-      if (targetConfig.algorithm === "py32f0") {
-        await session.dap.configureTransfer(0, PY32_DAP_WAIT_RETRY, 0);
-        addLog("DAP wait retry extended for PY32 flash\n");
-      }
+      await session.dap.configureTransfer(0, PY32_DAP_WAIT_RETRY, 0);
+      addLog("DAP wait retry extended for PY32 flash\n");
       addLog("SWD connected\n");
 
       await target.halt();
@@ -577,11 +428,7 @@ export default function CortexProgrammer() {
 
       const callbacks = { addLog, setProgress };
 
-      if (targetConfig.algorithm === "py32f0") {
-        await flashPy32F0(target, firmwareImage, targetConfig, callbacks);
-      } else {
-        await flashStm32F1(target, firmwareImage, targetConfig, callbacks);
-      }
+      await flashPy32F0(target, firmwareImage, targetConfig, callbacks);
 
       setProgress(100);
       addLog("Cortex firmware flashed and verified\n");
@@ -615,16 +462,10 @@ export default function CortexProgrammer() {
     logsElement.scrollTop = logsElement.scrollHeight;
   }, [logs, showConsole]);
 
-  const busy = testing || connectingTarget || flashing;
+  const busy = flashing;
   const selectedTargetConfig = TARGETS[selectedTarget];
   const firmwareSize = firmware ? formatBytes(firmware.size) : "No file";
-  const statusLabel = flashing
-    ? "Programming"
-    : connectingTarget
-      ? "Connecting"
-      : testing
-        ? "Testing"
-        : "Ready";
+  const statusLabel = flashing ? "Programming" : "Ready";
   const statusClass = busy
     ? "border-amber-300 bg-amber-50 text-amber-800"
     : "border-emerald-300 bg-emerald-50 text-emerald-800";
@@ -684,7 +525,7 @@ export default function CortexProgrammer() {
                     className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-950 placeholder:text-slate-400"
                     disabled={busy}
                     onChange={(event) => setTargetSearch(event.target.value)}
-                    placeholder="py32f003, stm32, gd32..."
+                    placeholder="py32f003x4, py32f003x6, py32f003x8..."
                     type="search"
                     value={targetSearch}
                   />
@@ -829,24 +670,6 @@ export default function CortexProgrammer() {
               Actions
             </div>
             <div className="grid gap-2">
-              <button
-                className={`${buttonBase} border-slate-300 bg-white text-slate-800 hover:bg-slate-100`}
-                disabled={busy}
-                onClick={testCmsisDap}
-                type="button"
-              >
-                {testing ? "Testing CMSIS-DAP..." : "Test CMSIS-DAP"}
-              </button>
-
-              <button
-                className={`${buttonBase} border-cyan-300 bg-cyan-50 text-cyan-900 hover:bg-cyan-100`}
-                disabled={busy || !selectedTargetAvailable}
-                onClick={connectCortexTarget}
-                type="button"
-              >
-                {connectingTarget ? "Connecting target..." : "Connect Cortex"}
-              </button>
-
               <button
                 className={`${buttonBase} border-slate-900 bg-slate-950 text-white hover:bg-slate-800`}
                 disabled={busy || !firmware || !selectedTargetAvailable}

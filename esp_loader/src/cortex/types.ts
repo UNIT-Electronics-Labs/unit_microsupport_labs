@@ -11,17 +11,6 @@ export type FlashCallbacks = {
   setProgress(value: number): void;
 };
 
-export type Stm32F1TargetConfig = {
-  label: string;
-  description: string;
-  family: "stm32" | "gd32";
-  algorithm: "stm32f1";
-  flashBase: number;
-  flashSizeBytes: number;
-  pageSize: number;
-  deviceId?: number;
-};
-
 export type Py32F0TargetConfig = {
   label: string;
   description: string;
@@ -34,7 +23,7 @@ export type Py32F0TargetConfig = {
   timingProfile: "py32f0" | "py32f071";
 };
 
-export type CortexTargetConfig = Stm32F1TargetConfig | Py32F0TargetConfig;
+export type CortexTargetConfig = Py32F0TargetConfig;
 
 export type CortexFlashAlgorithm = (
   target: CortexM,

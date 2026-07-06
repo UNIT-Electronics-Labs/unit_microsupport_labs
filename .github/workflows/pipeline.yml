@@ -8,15 +8,9 @@ on:
 
 permissions:
   contents: write
-  pages: write
-  id-token: write
-
-concurrency:
-  group: "pages"
-  cancel-in-progress: false
 
 jobs:
-  build:
+  build-and-deploy:
     runs-on: ubuntu-latest
     
     steps:
@@ -38,40 +32,18 @@ jobs:
         working-directory: ./esp_loader
         run: npm run build
 
-      - name: Prepare docs Directory
+      - name: Deploy to docs Directory
         run: |
           rm -rf docs/*
           mkdir -p docs
           cp -r esp_loader/dist/* docs/
           touch docs/.nojekyll
-
-      - name: Commit and Push docs
-        run: |
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git config --global user.name "github-actions[bot]"
           git add docs/
-          git diff --quiet && git diff --staged --quiet || (git commit -m "chore: auto-update docs build artifacts [skip ci]" && git push origin main)
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: auto-update docs build artifacts [skip ci]"
+            git push origin main
+          fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload Pages Artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: ./docs
-
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    
-    permissions:
-      pages: write
-      id-token: write
-    
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4

@@ -19,6 +19,8 @@ import {
 
 const CORTEX_CPUID_ADDRESS = 0xe000ed00;
 const MAX_PANEL_SLOTS = 10;
+const probeInstanceIds = new WeakMap<object, number>();
+let nextProbeInstanceId = 1;
 
 type FamilyFilter = "all" | "stm32" | "py32" | "gd32";
 type CmsisTransportKind = "auto" | "webhid" | "webusb";
@@ -226,11 +228,23 @@ function createAuthorizedProbe(
   const serialLabel = device.serialNumber
     ? ` · S/N ${device.serialNumber}`
     : "";
+  let instanceId = index;
+
+  if (typeof device === "object" && device !== null) {
+    const rememberedInstanceId = probeInstanceIds.get(device);
+    if (rememberedInstanceId !== undefined) {
+      instanceId = rememberedInstanceId;
+    } else {
+      instanceId = nextProbeInstanceId;
+      nextProbeInstanceId += 1;
+      probeInstanceIds.set(device, instanceId);
+    }
+  }
 
   return {
     id:
       `${transport}:${formatUsbId(device.vendorId)}:${formatUsbId(device.productId)}:` +
-      `${device.serialNumber ?? "no-serial"}:${index}`,
+      `${device.serialNumber ?? "no-serial"}:${instanceId}`,
     label:
       `${device.productName ?? "CMSIS-DAP"} ` +
       `(${formatUsbId(device.vendorId)}:${formatUsbId(device.productId)}) · ${versionLabel}${serialLabel}`,
@@ -386,6 +400,9 @@ export default function CortexProgrammer() {
   >([]);
   const [selectedProbeId, setSelectedProbeId] = useState("");
   const [batchProbeIds, setBatchProbeIds] = useState<string[]>([]);
+  const [panelSlotProbeIds, setPanelSlotProbeIds] = useState<
+    Array<string | null>
+  >(() => Array.from({ length: MAX_PANEL_SLOTS }, () => null));
   const [batchStatuses, setBatchStatuses] = useState<
     Record<string, BatchProbeStatus>
   >({});
@@ -404,6 +421,7 @@ export default function CortexProgrammer() {
   const [authorizingProbe, setAuthorizingProbe] = useState<
     AuthorizedCmsisProbe["transport"] | null
   >(null);
+  const [authorizingSlot, setAuthorizingSlot] = useState<number | null>(null);
   const logsContainerRef = useRef<HTMLDivElement | null>(null);
 
   function addLog(text: string) {
@@ -481,6 +499,27 @@ export default function CortexProgrammer() {
 
       setAuthorizedProbes(rememberedProbes);
       setAuthorizedProbeCount(rememberedProbes.length);
+      setPanelSlotProbeIds((current) => {
+        const availableIds = new Set(
+          rememberedProbes.map((probe) => probe.id)
+        );
+        const nextSlots = current.map((probeId) =>
+          probeId && availableIds.has(probeId) ? probeId : null
+        );
+        const assignedIds = new Set(
+          nextSlots.filter((probeId): probeId is string => probeId !== null)
+        );
+
+        for (const probe of rememberedProbes) {
+          if (assignedIds.has(probe.id)) continue;
+          const emptySlot = nextSlots.indexOf(null);
+          if (emptySlot === -1) break;
+          nextSlots[emptySlot] = probe.id;
+          assignedIds.add(probe.id);
+        }
+
+        return nextSlots;
+      });
       setBatchProbeIds((current) =>
         current.filter((probeId) =>
           rememberedProbes.some((probe) => probe.id === probeId)
@@ -690,7 +729,8 @@ export default function CortexProgrammer() {
   }
 
   async function authorizeCmsisDapProbe(
-    transportKind: AuthorizedCmsisProbe["transport"]
+    transportKind: AuthorizedCmsisProbe["transport"],
+    slotIndex?: number
   ) {
     if (!window.isSecureContext) {
       addLog(
@@ -700,6 +740,7 @@ export default function CortexProgrammer() {
     }
 
     setAuthorizingProbe(transportKind);
+    setAuthorizingSlot(slotIndex ?? null);
     try {
       let selectedDevice: WebUsbDeviceInfo | null = null;
 
@@ -758,6 +799,19 @@ export default function CortexProgrammer() {
         setSelectedProbeId(selectedProbe.id);
         setDetectedProbe(selectedProbe.label);
         setCmsisTransport("auto");
+        if (slotIndex !== undefined) {
+          setPanelSlotProbeIds((current) =>
+            current.map((probeId, index) => {
+              if (index === slotIndex) return selectedProbe.id;
+              return probeId === selectedProbe.id ? null : probeId;
+            })
+          );
+          setBatchProbeIds((current) =>
+            current.includes(selectedProbe.id)
+              ? current
+              : [...current, selectedProbe.id]
+          );
+        }
         addLog(`CMSIS-DAP autorizado: ${selectedProbe.label}\n`);
       }
     } catch (err: unknown) {
@@ -766,6 +820,7 @@ export default function CortexProgrammer() {
       );
     } finally {
       setAuthorizingProbe(null);
+      setAuthorizingSlot(null);
     }
   }
 
@@ -1561,9 +1616,9 @@ export default function CortexProgrammer() {
   const programmingProbeCount = batchStatusValues.filter(
     (status) => status.state === "programming"
   ).length;
-  const panelSlots = Array.from(
-    { length: MAX_PANEL_SLOTS },
-    (_, index) => authorizedProbes[index] ?? null
+  const panelSlots = panelSlotProbeIds.map(
+    (probeId) =>
+      authorizedProbes.find((probe) => probe.id === probeId) ?? null
   );
   const selectedTargetConfig = TARGETS[selectedTarget];
   const statusLabel = flashing
@@ -1937,24 +1992,61 @@ export default function CortexProgrammer() {
                     {authorizedProbes.length} conectados
                   </div>
                 </div>
-                <div className="grid min-w-0 gap-3 md:grid-cols-2 min-[1280px]:grid-cols-3">
+                <div className="mb-3 rounded-md border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600">
+                  Pulsa <strong>v2</strong> o <strong>v1</strong> dentro de
+                  cada socket para asignar un programador nuevo. Los
+                  programadores autorizados anteriormente aparecen solos al
+                  conectarlos.
+                </div>
+                <div className="grid min-w-0 gap-2 sm:grid-cols-2 lg:grid-cols-3 min-[1450px]:grid-cols-5">
                   {panelSlots.map((probe, slotIndex) => {
                     if (!probe) {
                       return (
                         <div
-                          className="grid min-h-36 place-items-center rounded-lg border border-dashed border-slate-300 bg-slate-100/60 p-4 text-center"
+                          className="grid min-h-24 content-between gap-2 rounded-md border border-dashed border-slate-300 bg-slate-100/60 p-2.5"
                           key={`empty-slot-${slotIndex}`}
                         >
-                          <div>
-                            <div className="mx-auto mb-2 grid size-8 place-items-center rounded-full border border-slate-300 bg-white font-mono text-xs font-bold text-slate-400">
+                          <div className="flex items-center gap-2">
+                            <div className="grid size-6 shrink-0 place-items-center rounded-full border border-slate-300 bg-white font-mono text-[10px] font-bold text-slate-400">
                               {slotIndex + 1}
                             </div>
-                            <div className="text-sm font-semibold text-slate-500">
+                            <div className="text-xs font-semibold text-slate-500">
                               Socket vacío
                             </div>
-                            <div className="mt-1 text-xs text-slate-400">
-                              Autoriza o conecta un CMSIS-DAP
-                            </div>
+                          </div>
+                          <div className="grid grid-cols-2 gap-1.5">
+                            <button
+                              className="rounded border border-cyan-500 bg-white px-2 py-1.5 text-[11px] font-bold text-cyan-900 hover:bg-cyan-50 disabled:opacity-50"
+                              disabled={busy || !webUsbAvailable}
+                              onClick={() =>
+                                void authorizeCmsisDapProbe(
+                                  "webusb",
+                                  slotIndex
+                                )
+                              }
+                              type="button"
+                            >
+                              {authorizingSlot === slotIndex &&
+                              authorizingProbe === "webusb"
+                                ? "..."
+                                : "v2 / USB"}
+                            </button>
+                            <button
+                              className="rounded border border-cyan-500 bg-white px-2 py-1.5 text-[11px] font-bold text-cyan-900 hover:bg-cyan-50 disabled:opacity-50"
+                              disabled={busy || !webHidAvailable}
+                              onClick={() =>
+                                void authorizeCmsisDapProbe(
+                                  "webhid",
+                                  slotIndex
+                                )
+                              }
+                              type="button"
+                            >
+                              {authorizingSlot === slotIndex &&
+                              authorizingProbe === "webhid"
+                                ? "..."
+                                : "v1 / HID"}
+                            </button>
                           </div>
                         </div>
                       );
@@ -1971,14 +2063,14 @@ export default function CortexProgrammer() {
                                 : "border-slate-200 bg-slate-50 text-slate-700";
 
                         return (
-                          <label
-                            className={`relative grid min-h-36 min-w-0 cursor-pointer content-between gap-3 rounded-lg border p-4 text-xs shadow-sm transition hover:-translate-y-0.5 hover:shadow ${statusClassName}`}
+                          <div
+                            className={`relative grid min-h-24 min-w-0 content-between gap-2 rounded-md border p-2.5 text-xs shadow-sm transition ${statusClassName}`}
                             key={probe.id}
                           >
-                            <span className="absolute right-3 top-3 grid size-7 place-items-center rounded-full border border-current/15 bg-white/70 font-mono text-[11px] font-bold opacity-70">
+                            <span className="absolute right-2 top-2 grid size-6 place-items-center rounded-full border border-current/15 bg-white/70 font-mono text-[10px] font-bold opacity-70">
                               {slotIndex + 1}
                             </span>
-                            <span className="flex min-w-0 items-start gap-2">
+                            <label className="flex min-w-0 cursor-pointer items-start gap-2">
                               <input
                                 checked={batchProbeIds.includes(probe.id)}
                                 className="mt-0.5 shrink-0"
@@ -1995,17 +2087,17 @@ export default function CortexProgrammer() {
                                 type="checkbox"
                               />
                               <span className="min-w-0">
-                                <span className="block break-words pr-8 text-sm font-bold leading-snug">
+                                <span className="block break-words pr-7 text-xs font-bold leading-snug">
                                   {probe.label.split(" · ")[0]}
                                 </span>
                                 <span className="mt-1 block break-words font-mono text-[10px] font-medium opacity-75">
                                   {probe.label.split(" · ").slice(1).join(" · ")}
                                 </span>
                               </span>
-                            </span>
+                            </label>
                             {probeStatus ? (
                               <>
-                                <span className="break-words pl-6 font-semibold">
+                                <span className="break-words pl-5 text-[11px] font-semibold">
                                   {probeStatus.state === "success"
                                     ? probeStatus.message || "Correcto"
                                     : probeStatus.state === "error"
@@ -2030,7 +2122,54 @@ export default function CortexProgrammer() {
                                 </span>
                               </>
                             ) : null}
-                          </label>
+                            <div className="flex justify-end gap-1">
+                              <button
+                                className="rounded border border-current/20 bg-white/70 px-1.5 py-1 text-[10px] font-bold hover:bg-white disabled:opacity-50"
+                                disabled={busy || !webUsbAvailable}
+                                onClick={() =>
+                                  void authorizeCmsisDapProbe(
+                                    "webusb",
+                                    slotIndex
+                                  )
+                                }
+                                type="button"
+                              >
+                                Cambiar v2
+                              </button>
+                              <button
+                                className="rounded border border-current/20 bg-white/70 px-1.5 py-1 text-[10px] font-bold hover:bg-white disabled:opacity-50"
+                                disabled={busy || !webHidAvailable}
+                                onClick={() =>
+                                  void authorizeCmsisDapProbe(
+                                    "webhid",
+                                    slotIndex
+                                  )
+                                }
+                                type="button"
+                              >
+                                Cambiar v1
+                              </button>
+                              <button
+                                className="rounded border border-current/20 bg-white/70 px-1.5 py-1 text-[10px] font-bold hover:bg-white disabled:opacity-50"
+                                disabled={busy}
+                                onClick={() => {
+                                  setPanelSlotProbeIds((current) =>
+                                    current.map((probeId, index) =>
+                                      index === slotIndex ? null : probeId
+                                    )
+                                  );
+                                  setBatchProbeIds((current) =>
+                                    current.filter(
+                                      (probeId) => probeId !== probe.id
+                                    )
+                                  );
+                                }}
+                                type="button"
+                              >
+                                Quitar
+                              </button>
+                            </div>
+                          </div>
                         );
                       })}
                 </div>

@@ -107,6 +107,19 @@ const KNOWN_CMSIS_DAP_IDS: Array<{ vendorId: number; productId?: number }> = [
   { vendorId: 0x1209, productId: 0x3444 },
 ];
 
+const PREFER_WEBUSB_DUAL_MODE_IDS = [
+  { vendorId: 0x0d28, productId: 0x0203 },
+  { vendorId: 0x0d28, productId: 0x0204 },
+  { vendorId: 0x0d28, productId: 0x0205 },
+] as const;
+
+function prefersWebUsbDualMode(device: WebUsbDeviceInfo): boolean {
+  return PREFER_WEBUSB_DUAL_MODE_IDS.some(
+    ({ vendorId, productId }) =>
+      device.vendorId === vendorId && device.productId === productId
+  );
+}
+
 function looksLikeCmsisDapDevice(device: {
   productName?: string;
   manufacturerName?: string;
@@ -364,7 +377,14 @@ class FlexibleWebUsbTransport implements DapTransport {
       throw new Error("Transport not opened");
     }
 
-    return this.activeTransport.read();
+    const response = await this.activeTransport.read();
+    if (response.byteLength < 2) {
+      throw new Error(
+        `CMSIS-DAP v2 returned a short response (${response.byteLength} byte(s)). Disconnect its duplicate WebHID v1 channel and retry.`
+      );
+    }
+
+    return response;
   }
 
   async write(data: BufferSource): Promise<void> {
@@ -485,7 +505,10 @@ export default function CortexProgrammer() {
       const webHidProbes = getCmsisDapDevices(hidDevices).filter(
         (hidDevice) =>
           !webUsbProbes.some((usbDevice) =>
-            isSamePhysicalProbe(usbDevice, hidDevice)
+            isSamePhysicalProbe(usbDevice, hidDevice) ||
+            (prefersWebUsbDualMode(hidDevice) &&
+              usbDevice.vendorId === hidDevice.vendorId &&
+              usbDevice.productId === hidDevice.productId)
           )
       );
       const rememberedProbes = [
@@ -778,6 +801,12 @@ export default function CortexProgrammer() {
             "El dispositivo HID seleccionado no se identificó como CMSIS-DAP."
           );
         }
+
+        if (prefersWebUsbDualMode(selectedDevice)) {
+          throw new Error(
+            `${selectedDevice.productName ?? "Este CMSIS-DAP"} expone v1 y v2 en el mismo dispositivo. Asígnalo con el botón v2 / USB para evitar usar ambas interfaces simultáneamente.`
+          );
+        }
       }
 
       const probes = await scanAuthorizedProbes(
@@ -921,7 +950,10 @@ export default function CortexProgrammer() {
         (device) =>
           looksLikeCmsisDapDevice(device) &&
           !authorizedUsbDevices.some((usbDevice) =>
-            isSamePhysicalProbe(usbDevice, device)
+            isSamePhysicalProbe(usbDevice, device) ||
+            (prefersWebUsbDualMode(device) &&
+              usbDevice.vendorId === device.vendorId &&
+              usbDevice.productId === device.productId)
           )
       );
 
@@ -964,8 +996,10 @@ export default function CortexProgrammer() {
                     device.vendorId === 0x1a86 &&
                     device.productId === 0x8011
                 ) ??
-              rememberedDevices.find((device) =>
-                looksLikeCmsisDapDevice(device)
+              rememberedDevices.find(
+                (device) =>
+                  looksLikeCmsisDapDevice(device) &&
+                  !prefersWebUsbDualMode(device)
               ) ??
               null;
 
@@ -989,8 +1023,10 @@ export default function CortexProgrammer() {
           filters: [],
         });
         const device =
-          devices.find((currentDevice) =>
-            looksLikeCmsisDapDevice(currentDevice)
+          devices.find(
+            (currentDevice) =>
+              looksLikeCmsisDapDevice(currentDevice) &&
+              !prefersWebUsbDualMode(currentDevice)
           ) ?? null;
 
         if (device) {

@@ -1105,6 +1105,135 @@ export default function CortexProgrammer() {
     }
   }
 
+  async function testSelectedCortexTargets() {
+    if (connectingTarget || flashing) {
+      addLog("A Cortex operation is already in progress; wait for it to finish.\n");
+      return;
+    }
+
+    const selectedProbes = authorizedProbes.filter((probe) =>
+      batchProbeIds.includes(probe.id)
+    );
+    if (selectedProbes.length === 0) {
+      alert("Selecciona al menos un programador para probar");
+      return;
+    }
+
+    const targetConfig = TARGETS[selectedTarget];
+    const initialStatuses = Object.fromEntries(
+      selectedProbes.map((probe) => [
+        probe.id,
+        {
+          state: "waiting",
+          progress: 0,
+          message: "Esperando prueba",
+        } satisfies BatchProbeStatus,
+      ])
+    );
+
+    const updateProbeStatus = (
+      probeId: string,
+      update: Partial<BatchProbeStatus>
+    ) => {
+      setBatchStatuses((current) => ({
+        ...current,
+        [probeId]: {
+          ...(current[probeId] ?? { state: "waiting", progress: 0 }),
+          ...update,
+        },
+      }));
+    };
+
+    setConnectingTarget(true);
+    setProgress(0);
+    setBatchStatuses(initialStatuses);
+    addLog(
+      `\n=== Prueba de panel: ${selectedProbes.length} canal(es), target ${targetConfig.label} ===\n`
+    );
+
+    const results = await Promise.allSettled(
+      selectedProbes.map(async (probe) => {
+        const channelLog = (message: string) =>
+          addLog(`[${probe.label}] ${message}`);
+        let transport: DapTransport | null = null;
+        let target: CortexM | null = null;
+
+        updateProbeStatus(probe.id, {
+          state: "programming",
+          progress: 10,
+          message: "Conectando SWD",
+        });
+
+        try {
+          const connectedProbe = await resolveConnectedProbe(probe);
+          transport =
+            connectedProbe.transport === "webhid"
+              ? new WebHidCmsisDapTransport(
+                  connectedProbe.device as WebHidDevice
+                )
+              : new FlexibleWebUsbTransport(
+                  connectedProbe.device as ConstructorParameters<
+                    typeof DapWebUSB
+                  >[0],
+                  channelLog
+                );
+
+          const session = createCortexTarget(transport);
+          target = session.target;
+          await target.connect();
+          if (targetConfig.algorithm === "py32f0") {
+            await session.dap.configureTransfer(0, PY32_DAP_WAIT_RETRY, 0);
+          }
+
+          updateProbeStatus(probe.id, {
+            progress: 60,
+            message: "Leyendo target",
+          });
+          await target.halt();
+          const cpuid = await target.readMem32(CORTEX_CPUID_ADDRESS);
+          channelLog(`SWD OK · CPUID ${formatHex32(cpuid)}\n`);
+          await target.resume(false);
+
+          updateProbeStatus(probe.id, {
+            state: "success",
+            progress: 100,
+            message: `SWD OK · CPUID ${formatHex32(cpuid)}`,
+          });
+          return probe;
+        } catch (err: unknown) {
+          const message = getErrorMessage(err);
+          updateProbeStatus(probe.id, {
+            state: "error",
+            progress: 100,
+            message,
+          });
+          channelLog(`FALLO DE PRUEBA: ${message}\n`);
+          throw new Error(`${probe.label}: ${message}`, { cause: err });
+        } finally {
+          try {
+            await target?.disconnect();
+          } catch {
+            try {
+              await transport?.close();
+            } catch {
+              // This channel is already closed or unavailable.
+            }
+          }
+        }
+      })
+    );
+
+    const successful = results.filter(
+      (result) => result.status === "fulfilled"
+    ).length;
+    const failed = results.length - successful;
+    setProgress(100);
+    addLog(
+      `=== Prueba terminada: ${successful} correctos, ${failed} fallidos, ${results.length} total ===\n`
+    );
+    setConnectingTarget(false);
+  }
+
   async function flashCortexFirmware() {
     if (connectingTarget || flashing) {
       addLog("A Cortex operation is already in progress; wait for it to finish.\n");
@@ -1878,11 +2007,11 @@ export default function CortexProgrammer() {
                               <>
                                 <span className="break-words pl-6 font-semibold">
                                   {probeStatus.state === "success"
-                                    ? "Correcto"
+                                    ? probeStatus.message || "Correcto"
                                     : probeStatus.state === "error"
                                       ? `Falló: ${probeStatus.message}`
                                       : probeStatus.state === "programming"
-                                        ? `Programando ${probeStatus.progress.toFixed(0)}%`
+                                        ? `${probeStatus.message || "Procesando"} ${probeStatus.progress.toFixed(0)}%`
                                         : "En espera"}
                                 </span>
                                 <span className="ml-6 h-1.5 overflow-hidden rounded-full bg-white/80">
@@ -1933,6 +2062,21 @@ export default function CortexProgrammer() {
                   </div>
                 </div>
               </div>
+
+              <button
+                className={`${buttonBase} border-cyan-600 bg-white text-cyan-900 shadow-sm hover:bg-cyan-50`}
+                disabled={
+                  busy ||
+                  !selectedTargetAvailable ||
+                  selectedBatchProbeCount === 0
+                }
+                onClick={testSelectedCortexTargets}
+                type="button"
+              >
+                {connectingTarget
+                  ? "Probando panel..."
+                  : `Probar seleccionados · ${selectedBatchProbeCount}`}
+              </button>
 
               <button
                 className={`${buttonBase} min-h-12 border-cyan-500 bg-cyan-400 text-base text-slate-950 shadow-sm hover:border-cyan-300 hover:bg-cyan-300`}

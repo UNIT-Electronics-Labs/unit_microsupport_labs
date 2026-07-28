@@ -1,4 +1,4 @@
-name: Build & Deploy to GitHub Pages
+name: Build, Download & Deploy
 
 on:
   push:
@@ -31,6 +31,22 @@ jobs:
       - name: Build Application
         working-directory: ./esp_loader
         run: npm run build
+
+      - name: Upload Downloadable Web Build
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-microsupport-labs-web-${{ github.run_number }}
+          path: esp_loader/dist/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Add Download Instructions
+        run: |
+          {
+            echo "### Descarga del compilado"
+            echo ""
+            echo "Descarga **unit-microsupport-labs-web-${{ github.run_number }}** desde la sección **Artifacts** de esta ejecución."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Deploy to docs Directory
         run: |

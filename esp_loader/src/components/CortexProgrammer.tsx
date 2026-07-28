@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   CmsisDAP,
   CortexM,
@@ -17,29 +17,37 @@ import {
   getErrorMessage,
 } from "../cortex/utils";
 
-const DAP_INFO_REQUESTS = {
-  VENDOR_ID: 0x01,
-  PRODUCT_ID: 0x02,
-  SERIAL_NUMBER: 0x03,
-  CMSIS_DAP_FW_VERSION: 0x04,
-  CAPABILITIES: 0xf0,
-  PACKET_COUNT: 0xfe,
-  PACKET_SIZE: 0xff,
-} as const;
-
-const CMSIS_DAP_USB_FILTERS = [
-  { vendorId: 0x0d28 },
-  { vendorId: 0xc251 },
-  { vendorId: 0x1209 },
-  { vendorId: 0x1fc9 },
-  { vendorId: 0x0483 },
-  { vendorId: 0x2e8a },
-  { vendorId: 0x303a },
-] as const;
-
 const CORTEX_CPUID_ADDRESS = 0xe000ed00;
+const MAX_PANEL_SLOTS = 10;
 
 type FamilyFilter = "all" | "stm32" | "py32" | "gd32";
+type CmsisTransportKind = "auto" | "webhid" | "webusb";
+type WebUsbDeviceInfo = {
+  vendorId?: number;
+  productId?: number;
+  productName?: string;
+  manufacturerName?: string;
+  serialNumber?: string;
+  configurations?: Array<{
+    interfaces: Array<{
+      alternates: Array<{
+        interfaceClass: number;
+        interfaceName?: string;
+      }>;
+    }>;
+  }>;
+};
+type AuthorizedCmsisProbe = {
+  id: string;
+  label: string;
+  transport: Exclude<CmsisTransportKind, "auto">;
+  device: unknown;
+};
+type BatchProbeStatus = {
+  state: "waiting" | "programming" | "success" | "error";
+  progress: number;
+  message?: string;
+};
 
 const FAMILY_FILTERS = [
   { id: "all", label: "Todos" },
@@ -65,6 +73,8 @@ type WebHidDevice = EventTarget & {
 type WebHidApi = {
   getDevices?: () => Promise<WebHidDevice[]>;
   requestDevice(options: { filters: unknown[] }): Promise<WebHidDevice[]>;
+  addEventListener?: (type: string, listener: EventListener) => void;
+  removeEventListener?: (type: string, listener: EventListener) => void;
 };
 
 type FileSystemFileHandleLike = {
@@ -84,10 +94,21 @@ function formatUsbId(value?: number): string {
   return value === undefined ? "????" : value.toString(16).padStart(4, "0");
 }
 
+const KNOWN_CMSIS_DAP_IDS: Array<{ vendorId: number; productId?: number }> = [
+  { vendorId: 0x2e8a, productId: 0x000c },
+  { vendorId: 0x0d28, productId: 0x0204 },
+  { vendorId: 0x0d28, productId: 0x0203 },
+  { vendorId: 0x0d28, productId: 0x0205 },
+  { vendorId: 0x1209, productId: 0x3443 },
+  { vendorId: 0x1209, productId: 0x3444 },
+];
+
 function looksLikeCmsisDapDevice(device: {
   productName?: string;
   manufacturerName?: string;
   serialNumber?: string;
+  vendorId?: number;
+  productId?: number;
 }): boolean {
   const text = [
     device.productName,
@@ -98,13 +119,113 @@ function looksLikeCmsisDapDevice(device: {
     .join(" ")
     .toLowerCase();
 
-  return (
-    text.includes("cmsis") ||
-    text.includes("dap") ||
-    text.includes("daplink") ||
-    text.includes("unit") ||
-    text.includes("ch552")
+  const hasKnownCmsisDapId = KNOWN_CMSIS_DAP_IDS.some(
+    ({ vendorId, productId }) =>
+      device.vendorId === vendorId &&
+      (productId === undefined || device.productId === productId)
   );
+
+  const hasKnownUnitElectronicsProbe =
+    device.vendorId === 0x2e8a &&
+    (device.productId === 0x000c || text.includes("unit electronics") || text.includes("ue pico"));
+
+  const looksLikeGenericHidPeripheral =
+    text.includes("keyboard") ||
+    text.includes("mouse") ||
+    text.includes("bluetooth") ||
+    text.includes("wifi") ||
+    text.includes("gaming") ||
+    text.includes("gamepad") ||
+    text.includes("headset") ||
+    text.includes("audio") ||
+    text.includes("speaker") ||
+    text.includes("microphone") ||
+    text.includes("controller") ||
+    text.includes("touchpad");
+
+  return (
+    hasKnownCmsisDapId ||
+    hasKnownUnitElectronicsProbe ||
+    (!looksLikeGenericHidPeripheral &&
+      (text.includes("cmsis") ||
+        text.includes("dap") ||
+        text.includes("daplink") ||
+        text.includes("mbed") ||
+        text.includes("arm mbed") ||
+        text.includes("qinheng") ||
+        text.includes("wch") ||
+        text.includes("unit") ||
+        text.includes("ue pico") ||
+        text.includes("pico debugger") ||
+        text.includes("ch552")))
+  );
+}
+
+function getCmsisDapDevices(devices: unknown[]): WebUsbDeviceInfo[] {
+  return devices
+    .map((device) => device as WebUsbDeviceInfo)
+    .filter((device) => looksLikeCmsisDapDevice(device));
+}
+
+function hasCmsisDapV2Interface(device: WebUsbDeviceInfo): boolean {
+  return (
+    device.configurations?.some((configuration) =>
+      configuration.interfaces.some((usbInterface) =>
+        usbInterface.alternates.some((alternate) => {
+          const interfaceName = alternate.interfaceName?.toLowerCase() ?? "";
+          return (
+            alternate.interfaceClass === 0xff &&
+            (interfaceName.includes("cmsis-dap v2") ||
+              interfaceName.includes("cmsis dap v2"))
+          );
+        })
+      )
+    ) ?? false
+  );
+}
+
+function getWebUsbCmsisDapDevices(devices: unknown[]): WebUsbDeviceInfo[] {
+  return getCmsisDapDevices(devices).filter((device) => {
+    const hasKnownV2Id = KNOWN_CMSIS_DAP_IDS.some(
+      ({ vendorId, productId }) =>
+        device.vendorId === vendorId &&
+        (productId === undefined || device.productId === productId)
+    );
+    return hasKnownV2Id || hasCmsisDapV2Interface(device);
+  });
+}
+
+function isSamePhysicalProbe(
+  first: WebUsbDeviceInfo,
+  second: WebUsbDeviceInfo
+): boolean {
+  return (
+    first.vendorId === second.vendorId &&
+    first.productId === second.productId
+  );
+}
+
+function createAuthorizedProbe(
+  device: WebUsbDeviceInfo,
+  transport: AuthorizedCmsisProbe["transport"],
+  index: number
+): AuthorizedCmsisProbe {
+  const versionLabel =
+    transport === "webusb" ? "v2 / WebUSB" : "v1 / WebHID";
+  const serialLabel = device.serialNumber
+    ? ` · S/N ${device.serialNumber}`
+    : "";
+
+  return {
+    id:
+      `${transport}:${formatUsbId(device.vendorId)}:${formatUsbId(device.productId)}:` +
+      `${device.serialNumber ?? index}`,
+    label:
+      `${device.productName ?? "CMSIS-DAP"} ` +
+      `(${formatUsbId(device.vendorId)}:${formatUsbId(device.productId)}) · ${versionLabel}${serialLabel}`,
+    transport,
+    device,
+  };
 }
 
 class WebHidCmsisDapTransport implements DapTransport {
@@ -156,6 +277,80 @@ class WebHidCmsisDapTransport implements DapTransport {
   }
 }
 
+class FlexibleWebUsbTransport implements DapTransport {
+  public readonly packetSize = 64;
+
+  private device: ConstructorParameters<typeof DapWebUSB>[0];
+  private activeTransport: DapTransport | null = null;
+  private log: ((message: string) => void) | undefined;
+
+  constructor(device: ConstructorParameters<typeof DapWebUSB>[0], log?: (message: string) => void) {
+    this.device = device;
+    this.log = log;
+  }
+
+  async open(): Promise<void> {
+    if (this.activeTransport) {
+      await this.activeTransport.open();
+      return;
+    }
+
+    const candidates = [
+      { label: "vendor-specific", interfaceClass: 0xff, configuration: 1 },
+      { label: "cdc", interfaceClass: 0x03, configuration: 1 },
+      { label: "cdc-data", interfaceClass: 0x0a, configuration: 1 },
+      { label: "default", interfaceClass: 0x00, configuration: 1 },
+    ];
+
+    const failures: string[] = [];
+
+    for (const candidate of candidates) {
+      const transport = new DapWebUSB(
+        this.device,
+        candidate.interfaceClass,
+        candidate.configuration
+      );
+
+      try {
+        await transport.open();
+        this.activeTransport = transport;
+        this.log?.(
+          `WebUSB interface selected: ${candidate.label} (class 0x${candidate.interfaceClass.toString(16).padStart(2, "0")})\n`
+        );
+        return;
+      } catch (err: unknown) {
+        failures.push(
+          `${candidate.label}: ${getErrorMessage(err)}`
+        );
+      }
+    }
+
+    throw new Error(`Unable to open WebUSB CMSIS-DAP device. Attempts: ${failures.join(" | ")}`);
+  }
+
+  async close(): Promise<void> {
+    if (this.activeTransport) {
+      await this.activeTransport.close();
+    }
+  }
+
+  async read(): Promise<DataView> {
+    if (!this.activeTransport) {
+      throw new Error("Transport not opened");
+    }
+
+    return this.activeTransport.read();
+  }
+
+  async write(data: BufferSource): Promise<void> {
+    if (!this.activeTransport) {
+      throw new Error("Transport not opened");
+    }
+
+    return this.activeTransport.write(data);
+  }
+}
+
 function createCortexTarget(transport: DapTransport): {
   dap: CmsisDAP;
   target: CortexM;
@@ -171,8 +366,19 @@ export default function CortexProgrammer() {
   const [selectedTarget, setSelectedTarget] = useState<TargetKey>("stm32f103rc");
   const [familyFilter, setFamilyFilter] = useState<FamilyFilter>("all");
   const [targetSearch, setTargetSearch] = useState("");
+  const [cmsisTransport, setCmsisTransport] =
+    useState<CmsisTransportKind>("auto");
+  const [detectedProbe, setDetectedProbe] = useState("");
+  const [authorizedProbeCount, setAuthorizedProbeCount] = useState(0);
+  const [authorizedProbes, setAuthorizedProbes] = useState<
+    AuthorizedCmsisProbe[]
+  >([]);
+  const [selectedProbeId, setSelectedProbeId] = useState("");
+  const [batchProbeIds, setBatchProbeIds] = useState<string[]>([]);
+  const [batchStatuses, setBatchStatuses] = useState<
+    Record<string, BatchProbeStatus>
+  >({});
   const [logs, setLogs] = useState("");
-  const [testing, setTesting] = useState(false);
   const [connectingTarget, setConnectingTarget] = useState(false);
   const [flashing, setFlashing] = useState(false);
   const [firmware, setFirmware] = useState<File | null>(null);
@@ -180,23 +386,175 @@ export default function CortexProgrammer() {
   const [firmwareHandle, setFirmwareHandle] =
     useState<FileSystemFileHandleLike | null>(null);
   const [firmwareName, setFirmwareName] = useState("");
+  const [batchName, setBatchName] = useState("");
   const [progress, setProgress] = useState(0);
   const [showConsole, setShowConsole] = useState(false);
+  const [scanningProbes, setScanningProbes] = useState(false);
   const logsContainerRef = useRef<HTMLDivElement | null>(null);
 
   function addLog(text: string) {
     setLogs((prev) => prev + text);
   }
 
+  function rememberSelectedProbe(
+    device: WebUsbDeviceInfo,
+    transport: AuthorizedCmsisProbe["transport"]
+  ): AuthorizedCmsisProbe {
+    const existingProbe =
+      authorizedProbes.find((probe) => {
+        const existingDevice = probe.device as WebUsbDeviceInfo;
+        const sameSerial =
+          device.serialNumber !== undefined &&
+          existingDevice.serialNumber === device.serialNumber;
+        const sameUnserializedDevice =
+          device.serialNumber === undefined &&
+          existingDevice.serialNumber === undefined &&
+          existingDevice.productName === device.productName;
+
+        return (
+          probe.device === device ||
+          (probe.transport === transport &&
+            isSamePhysicalProbe(existingDevice, device) &&
+            (sameSerial || sameUnserializedDevice))
+        );
+      }) ?? null;
+    const probe =
+      existingProbe ??
+      createAuthorizedProbe(device, transport, authorizedProbes.length);
+
+    if (!existingProbe) {
+      setAuthorizedProbes((current) => [...current, probe]);
+      setAuthorizedProbeCount((current) => current + 1);
+    }
+    setSelectedProbeId(probe.id);
+    setDetectedProbe(probe.label);
+    return probe;
+  }
+
+  const scanAuthorizedProbes = useCallback(async (reason?: string) => {
+    const usb = (
+      navigator as Navigator & {
+        usb?: {
+          getDevices?: () => Promise<unknown[]>;
+        };
+      }
+    ).usb;
+    const hid = (navigator as Navigator & { hid?: WebHidApi }).hid;
+
+    if (!usb?.getDevices && !hid?.getDevices) return [];
+
+    setScanningProbes(true);
+    try {
+      const [usbDevices, hidDevices] = await Promise.all([
+        usb?.getDevices?.() ?? Promise.resolve([]),
+        hid?.getDevices?.() ?? Promise.resolve([]),
+      ]);
+      const webUsbProbes = getWebUsbCmsisDapDevices(usbDevices);
+      const webHidProbes = getCmsisDapDevices(hidDevices).filter(
+        (hidDevice) =>
+          !webUsbProbes.some((usbDevice) =>
+            isSamePhysicalProbe(usbDevice, hidDevice)
+          )
+      );
+      const rememberedProbes = [
+        ...webUsbProbes.map((device, index) =>
+          createAuthorizedProbe(device, "webusb", index)
+        ),
+        ...webHidProbes.map((device, index) =>
+          createAuthorizedProbe(device, "webhid", index)
+        ),
+      ];
+
+      setAuthorizedProbes(rememberedProbes);
+      setAuthorizedProbeCount(rememberedProbes.length);
+      setBatchProbeIds((current) =>
+        current.filter((probeId) =>
+          rememberedProbes.some((probe) => probe.id === probeId)
+        )
+      );
+      setBatchStatuses((current) =>
+        Object.fromEntries(
+          Object.entries(current).filter(([probeId]) =>
+            rememberedProbes.some((probe) => probe.id === probeId)
+          )
+        )
+      );
+      setSelectedProbeId((current) =>
+        rememberedProbes.some((probe) => probe.id === current)
+          ? current
+          : rememberedProbes.length === 1
+            ? rememberedProbes[0].id
+            : ""
+      );
+      setDetectedProbe((current) =>
+        rememberedProbes.some((probe) => probe.label === current)
+          ? current
+          : rememberedProbes.length === 1
+            ? rememberedProbes[0].label
+            : ""
+      );
+
+      if (reason) {
+        setLogs(
+          (previous) =>
+            previous +
+            `${reason}: ${rememberedProbes.length} programador(es) CMSIS-DAP conectado(s).\n`
+        );
+      }
+
+      return rememberedProbes;
+    } catch (err: unknown) {
+      setLogs(
+        (previous) =>
+          previous +
+          `No se pudieron reescanear los programadores: ${getErrorMessage(err)}\n`
+      );
+      return [];
+    } finally {
+      setScanningProbes(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    const usb = (
+      navigator as Navigator & {
+        usb?: {
+          addEventListener?: (type: string, listener: EventListener) => void;
+          removeEventListener?: (type: string, listener: EventListener) => void;
+        };
+      }
+    ).usb;
+    const hid = (navigator as Navigator & { hid?: WebHidApi }).hid;
+    const handleDeviceChange: EventListener = () => {
+      void scanAuthorizedProbes("Cambio de conexión detectado");
+    };
+
+    void scanAuthorizedProbes();
+    usb?.addEventListener?.("connect", handleDeviceChange);
+    usb?.addEventListener?.("disconnect", handleDeviceChange);
+    hid?.addEventListener?.("connect", handleDeviceChange);
+    hid?.addEventListener?.("disconnect", handleDeviceChange);
+
+    return () => {
+      usb?.removeEventListener?.("connect", handleDeviceChange);
+      usb?.removeEventListener?.("disconnect", handleDeviceChange);
+      hid?.removeEventListener?.("connect", handleDeviceChange);
+      hid?.removeEventListener?.("disconnect", handleDeviceChange);
+    };
+  }, [scanAuthorizedProbes]);
+
   const targetEntries = Object.entries(TARGETS) as Array<
     [TargetKey, (typeof TARGETS)[TargetKey]]
   >;
-  const normalizedSearch = targetSearch.trim().toLowerCase();
+  const normalizedTargetSearch = targetSearch.trim().toLowerCase();
   const filteredTargetEntries = targetEntries.filter(([key, target]) => {
     const matchesFamily =
       familyFilter === "all" || target.family === familyFilter;
-    const searchableText = `${key} ${target.label} ${target.description} ${target.family}`.toLowerCase();
-    return matchesFamily && searchableText.includes(normalizedSearch);
+    const searchableText =
+      `${key} ${target.label} ${target.description}`.toLowerCase();
+    return (
+      matchesFamily && searchableText.includes(normalizedTargetSearch)
+    );
   });
   const selectedTargetAvailable = filteredTargetEntries.some(
     ([key]) => key === selectedTarget
@@ -205,12 +563,15 @@ export default function CortexProgrammer() {
   function selectFamily(nextFamily: FamilyFilter) {
     setFamilyFilter(nextFamily);
 
-    if (nextFamily === "all") return;
-
     const firstMatchingTarget = targetEntries.find(
-      ([, target]) => target.family === nextFamily
+      ([, target]) =>
+        nextFamily === "all" || target.family === nextFamily
     );
-    if (firstMatchingTarget) {
+    if (
+      firstMatchingTarget &&
+      nextFamily !== "all" &&
+      TARGETS[selectedTarget].family !== nextFamily
+    ) {
       setSelectedTarget(firstMatchingTarget[0]);
     }
   }
@@ -303,6 +664,7 @@ export default function CortexProgrammer() {
     return (
       navigator as Navigator & {
         usb?: {
+          getDevices?: () => Promise<unknown[]>;
           requestDevice(options?: unknown): Promise<unknown>;
         };
       }
@@ -313,131 +675,267 @@ export default function CortexProgrammer() {
     return (navigator as Navigator & { hid?: WebHidApi }).hid;
   }
 
-  async function readCmsisDapInfo(transport: DapTransport) {
-    await transport.open();
+  async function resolveConnectedProbe(
+    probe: AuthorizedCmsisProbe
+  ): Promise<AuthorizedCmsisProbe> {
+    const rememberedDevice = probe.device as WebUsbDeviceInfo;
 
-    const dap = new CmsisDAP(transport);
-    const infoRequests = [
-      ["Vendor", DAP_INFO_REQUESTS.VENDOR_ID],
-      ["Product", DAP_INFO_REQUESTS.PRODUCT_ID],
-      ["Serial", DAP_INFO_REQUESTS.SERIAL_NUMBER],
-      ["CMSIS-DAP FW", DAP_INFO_REQUESTS.CMSIS_DAP_FW_VERSION],
-      ["Packet count", DAP_INFO_REQUESTS.PACKET_COUNT],
-      ["Packet size", DAP_INFO_REQUESTS.PACKET_SIZE],
-      ["Capabilities", DAP_INFO_REQUESTS.CAPABILITIES],
-    ] as const;
+    if (probe.transport === "webusb") {
+      const usb = getUsbApi();
+      const connectedDevices = getWebUsbCmsisDapDevices(
+        (await usb?.getDevices?.()) ?? []
+      );
+      const connectedDevice =
+        connectedDevices.find(
+          (device) =>
+            rememberedDevice.serialNumber !== undefined &&
+            device.serialNumber === rememberedDevice.serialNumber &&
+            isSamePhysicalProbe(device, rememberedDevice)
+        ) ??
+        connectedDevices.find((device) =>
+          isSamePhysicalProbe(device, rememberedDevice)
+        ) ??
+        null;
 
-    for (const [label, request] of infoRequests) {
-      try {
-        const value = await dap.dapInfo(request);
-        addLog(`${label}: ${value}\n`);
-      } catch (err: unknown) {
-        addLog(`${label}: unavailable (${getErrorMessage(err)})\n`);
+      if (!connectedDevice) {
+        throw new Error(
+          `${probe.label}: programador WebUSB desconectado o sin autorización`
+        );
       }
+
+      return {
+        ...probe,
+        device: connectedDevice,
+      };
     }
+
+    const hid = getHidApi();
+    const connectedDevices = (await hid?.getDevices?.()) ?? [];
+    const connectedDevice =
+      connectedDevices.find((device) => device === probe.device) ??
+      connectedDevices.find(
+        (device) =>
+          device.vendorId === rememberedDevice.vendorId &&
+          device.productId === rememberedDevice.productId &&
+          looksLikeCmsisDapDevice(device)
+      ) ?? null;
+
+    if (!connectedDevice) {
+      throw new Error(
+        `${probe.label}: programador WebHID desconectado o sin autorización`
+      );
+    }
+
+    return {
+      ...probe,
+      device: connectedDevice,
+    };
   }
 
   async function requestCmsisDapTransport(): Promise<DapTransport | null> {
-    const hid = getHidApi();
     const usb = getUsbApi();
+    const hid = getHidApi();
+    let selectedAuthorizedProbe =
+      authorizedProbes.find((probe) => probe.id === selectedProbeId) ?? null;
+    let activeTransport = cmsisTransport;
 
-    if (!hid && !usb) {
-      alert("WebHID/WebUSB APIs are not supported");
+    if (!usb && !hid) {
+      alert("WebUSB/WebHID APIs are not supported");
       return null;
     }
 
-    if (hid) {
-      const rememberedDevices = (await hid.getDevices?.()) ?? [];
-      let device =
-        rememberedDevices.find((currentDevice) =>
-          looksLikeCmsisDapDevice(currentDevice)
-        ) ?? null;
+    if (selectedAuthorizedProbe) {
+      try {
+        selectedAuthorizedProbe = await resolveConnectedProbe(
+          selectedAuthorizedProbe
+        );
+      } catch (err: unknown) {
+        addLog(`${getErrorMessage(err)}\n`);
+        selectedAuthorizedProbe = null;
+      }
+    }
 
-      if (device) {
-        addLog("Using remembered WebHID CMSIS-DAP probe.\n");
-      } else {
-        addLog("Using WebHID. Select the UnitElectronics CMSIS-DAP probe.\n");
-        const devices = await hid.requestDevice({ filters: [] });
-        device = devices[0] ?? null;
+    if (activeTransport === "auto") {
+      if (selectedAuthorizedProbe) {
+        activeTransport = selectedAuthorizedProbe.transport;
+        addLog(
+          `Selected CMSIS-DAP probe: ${selectedAuthorizedProbe.label}.\n`
+        );
       }
 
-      if (!device) {
-        addLog("No HID device selected\n");
-        return null;
+      const [usbDevices, hidDevices] = await Promise.all([
+        usb?.getDevices?.() ?? Promise.resolve([]),
+        hid?.getDevices?.() ?? Promise.resolve([]),
+      ]);
+      const authorizedUsbDevices = getWebUsbCmsisDapDevices(usbDevices);
+      const authorizedHidDevices = hidDevices.filter(
+        (device) =>
+          looksLikeCmsisDapDevice(device) &&
+          !authorizedUsbDevices.some((usbDevice) =>
+            isSamePhysicalProbe(usbDevice, device)
+          )
+      );
+
+      if (selectedAuthorizedProbe) {
+        // The selected probe already determines the transport.
+      } else if (
+        authorizedHidDevices.length > 0 &&
+        authorizedUsbDevices.length === 0
+      ) {
+        activeTransport = "webhid";
+      } else if (
+        authorizedUsbDevices.length > 0 &&
+        authorizedHidDevices.length === 0
+      ) {
+        activeTransport = "webusb";
+      } else if (!usb && hid) {
+        activeTransport = "webhid";
+      } else {
+        activeTransport = "webusb";
       }
 
       addLog(
-        `HID device selected: ${device.productName ?? "unknown product"} ` +
-          `(${formatUsbId(device.vendorId)}:${formatUsbId(device.productId)})\n`
+        `Automatic CMSIS-DAP transport: ${activeTransport === "webusb" ? "WebUSB v2" : "WebHID v1"}.\n`
       );
+    }
 
-      if (!looksLikeCmsisDapDevice(device)) {
-        addLog("Selected device does not look like a CMSIS-DAP probe.\n");
+    if (activeTransport === "webhid") {
+      if (!hid) {
+        addLog("WebHID is not supported by this browser.\n");
         return null;
       }
 
-      return new WebHidCmsisDapTransport(device);
-    }
+      try {
+        const rememberedDevices = (await hid.getDevices?.()) ?? [];
+        const rememberedDevice =
+          selectedAuthorizedProbe?.transport === "webhid"
+            ? (selectedAuthorizedProbe.device as WebHidDevice)
+            : rememberedDevices.find(
+                  (device) =>
+                    device.vendorId === 0x1a86 &&
+                    device.productId === 0x8011
+                ) ??
+              rememberedDevices.find((device) =>
+                looksLikeCmsisDapDevice(device)
+              ) ??
+              null;
 
-    if (!usb) return null;
+        if (rememberedDevice) {
+          const probe =
+            selectedAuthorizedProbe?.transport === "webhid"
+              ? selectedAuthorizedProbe
+              : rememberSelectedProbe(rememberedDevice, "webhid");
+          setSelectedProbeId(probe.id);
+          setDetectedProbe(probe.label);
+          addLog(
+            `CMSIS-DAP detectado automáticamente: ${probe.label}\n`
+          );
+          return new WebHidCmsisDapTransport(rememberedDevice);
+        }
 
-    addLog("Using WebUSB fallback.\n");
-    const device = await usb.requestDevice({
-      filters: [
-        ...CMSIS_DAP_USB_FILTERS,
-        { classCode: 0xff },
-      ],
-    });
+        addLog("Using WebHID. Select the CMSIS-DAP probe.\n");
+        const devices = await hid.requestDevice({
+          // An empty filter is intentional. Some CMSIS-DAP firmware exposes
+          // incomplete HID descriptors and disappears with VID/PID filters.
+          filters: [],
+        });
+        const device =
+          devices.find((currentDevice) =>
+            looksLikeCmsisDapDevice(currentDevice)
+          ) ?? null;
 
-    const usbDevice = device as {
-      vendorId?: number;
-      productId?: number;
-      productName?: string;
-      manufacturerName?: string;
-      serialNumber?: string;
-    };
+        if (device) {
+          const probe = rememberSelectedProbe(device, "webhid");
+          addLog(
+            `CMSIS-DAP HID seleccionado: ${probe.label}\n`
+          );
 
-    addLog(
-      `USB device selected: ${usbDevice.productName ?? "unknown product"} ` +
-        `(${formatUsbId(usbDevice.vendorId)}:${formatUsbId(usbDevice.productId)})\n`
-    );
+          return new WebHidCmsisDapTransport(device);
+        }
 
-    if (!looksLikeCmsisDapDevice(usbDevice)) {
-      addLog("Selected device does not look like a CMSIS-DAP probe.\n");
+        addLog("No WebHID device was selected.\n");
+      } catch (err: unknown) {
+        addLog(
+          `WebHID selection cancelled or unavailable: ${getErrorMessage(err)}\n`
+        );
+      }
+
       return null;
     }
 
-    return new DapWebUSB(device as ConstructorParameters<typeof DapWebUSB>[0]);
-  }
-
-  async function testCmsisDap() {
-    setTesting(true);
-    addLog("\nSearching Cortex CMSIS-DAP probe...\n");
-
-    let transport: DapTransport | null = null;
-
-    try {
-      transport = await requestCmsisDapTransport();
-      if (transport) {
-        await readCmsisDapInfo(transport);
+    if (activeTransport === "webusb") {
+      if (!usb) {
+        addLog("WebUSB is not supported by this browser.\n");
+        return null;
       }
 
-      addLog("CMSIS-DAP probe test finished\n");
-    } catch (err: unknown) {
-      console.error(err);
-      addLog(`CMSIS-DAP Error: ${getErrorMessage(err)}\n`);
-    } finally {
       try {
-        await transport?.close();
-      } catch {
-        // Already closed or unavailable.
-      }
+        const rememberedDevices = getWebUsbCmsisDapDevices(
+          (await usb.getDevices?.()) ?? []
+        );
+        const rememberedDevice =
+          selectedAuthorizedProbe?.transport === "webusb"
+            ? selectedAuthorizedProbe.device
+            : rememberedDevices.length === 1
+              ? rememberedDevices[0]
+              : null;
 
-      setTesting(false);
+        let device: unknown = rememberedDevice;
+        if (device) {
+          addLog("Using an authorized WebUSB CMSIS-DAP probe.\n");
+        } else {
+          addLog(
+            rememberedDevices.length > 1
+              ? `${rememberedDevices.length} authorized WebUSB probes found. Select one in the browser dialog.\n`
+              : "Using WebUSB. Select the CMSIS-DAP v2 probe in the browser dialog.\n"
+          );
+          device = await usb.requestDevice({
+            filters: KNOWN_CMSIS_DAP_IDS,
+          });
+        }
+
+        const usbDevice = device as {
+          vendorId?: number;
+          productId?: number;
+          productName?: string;
+          manufacturerName?: string;
+          serialNumber?: string;
+        };
+
+        addLog(
+          `USB device selected: ${usbDevice.productName ?? "unknown product"} ` +
+            `(${formatUsbId(usbDevice.vendorId)}:${formatUsbId(usbDevice.productId)})\n`
+        );
+
+        if (!looksLikeCmsisDapDevice(usbDevice)) {
+          addLog(
+            `Selected device is not clearly identified as CMSIS-DAP (${formatUsbId(usbDevice.vendorId)}:${formatUsbId(usbDevice.productId)}). Choose another device.\n`
+          );
+          return null;
+        }
+
+        rememberSelectedProbe(usbDevice, "webusb");
+
+        return new FlexibleWebUsbTransport(
+          device as ConstructorParameters<typeof DapWebUSB>[0],
+          addLog
+        );
+      } catch (err: unknown) {
+        addLog(
+          `WebUSB selection cancelled or unavailable: ${getErrorMessage(err)}\n`
+        );
+      }
     }
+
+    return null;
   }
 
   async function connectCortexTarget() {
+    if (connectingTarget || flashing) {
+      addLog("A Cortex operation is already in progress; wait for it to finish.\n");
+      return;
+    }
+
     setConnectingTarget(true);
     addLog("\nConnecting to Cortex target over SWD...\n");
 
@@ -514,6 +1012,11 @@ export default function CortexProgrammer() {
   }
 
   async function flashCortexFirmware() {
+    if (connectingTarget || flashing) {
+      addLog("A Cortex operation is already in progress; wait for it to finish.\n");
+      return;
+    }
+
     let selectedFirmware: {
       bytes: Uint8Array;
       name: string;
@@ -606,6 +1109,210 @@ export default function CortexProgrammer() {
     }
   }
 
+  async function flashCortexFirmwareBatch() {
+    if (connectingTarget || flashing) {
+      addLog("A Cortex operation is already in progress; wait for it to finish.\n");
+      return;
+    }
+
+    const selectedProbes = authorizedProbes.filter((probe) =>
+      batchProbeIds.includes(probe.id)
+    );
+    if (selectedProbes.length === 0) {
+      alert("Selecciona al menos un programador para el lote");
+      return;
+    }
+
+    let selectedFirmware: {
+      bytes: Uint8Array;
+      name: string;
+      size: number;
+    };
+
+    try {
+      const pickedFirmware = await askFirmwareForFlash();
+      if (!pickedFirmware) return;
+      selectedFirmware = pickedFirmware;
+    } catch (err: unknown) {
+      alert(getErrorMessage(err));
+      return;
+    }
+
+    const targetConfig = TARGETS[selectedTarget];
+    let firmwareImage: ReturnType<typeof parseFirmwareImage>;
+
+    try {
+      firmwareImage = parseFirmwareImage(
+        selectedFirmware.bytes,
+        selectedFirmware.name,
+        targetConfig
+      );
+      const flashOffset = firmwareImage.address - targetConfig.flashBase;
+      if (
+        flashOffset < 0 ||
+        flashOffset + firmwareImage.data.length > targetConfig.flashSizeBytes
+      ) {
+        throw new Error(
+          `Firmware image at ${formatHex32(firmwareImage.address)} exceeds ${targetConfig.label} flash`
+        );
+      }
+    } catch (err: unknown) {
+      alert(getErrorMessage(err));
+      return;
+    }
+
+    const progressByProbe = new Map(
+      selectedProbes.map((probe) => [probe.id, 0])
+    );
+    const initialStatuses = Object.fromEntries(
+      selectedProbes.map((probe) => [
+        probe.id,
+        { state: "waiting", progress: 0 } satisfies BatchProbeStatus,
+      ])
+    );
+
+    setFlashing(true);
+    setProgress(0);
+    setBatchStatuses(initialStatuses);
+    addLog(
+      `\n=== Lote ${batchName.trim() || "sin referencia"}: ${selectedProbes.length} canal(es), ${selectedFirmware.name} ===\n`
+    );
+
+    const updateProbeStatus = (
+      probeId: string,
+      update: Partial<BatchProbeStatus>
+    ) => {
+      setBatchStatuses((current) => ({
+        ...current,
+        [probeId]: {
+          ...(current[probeId] ?? { state: "waiting", progress: 0 }),
+          ...update,
+        },
+      }));
+    };
+
+    const updateProbeProgress = (probeId: string, nextProgress: number) => {
+      progressByProbe.set(probeId, nextProgress);
+      updateProbeStatus(probeId, { progress: nextProgress });
+      const totalProgress = Array.from(progressByProbe.values()).reduce(
+        (total, current) => total + current,
+        0
+      );
+      setProgress(
+        Number((totalProgress / selectedProbes.length).toFixed(1))
+      );
+    };
+
+    const results = await Promise.allSettled(
+      selectedProbes.map(async (probe) => {
+        const channelLog = (message: string) =>
+          addLog(`[${probe.label}] ${message}`);
+        let transport: DapTransport | null = null;
+        let target: CortexM | null = null;
+
+        updateProbeStatus(probe.id, {
+          state: "programming",
+          progress: 0,
+          message: "Conectando",
+        });
+        channelLog("Inicio del canal\n");
+
+        try {
+          const connectedProbe = await resolveConnectedProbe(probe);
+          transport =
+            connectedProbe.transport === "webhid"
+              ? new WebHidCmsisDapTransport(
+                  connectedProbe.device as WebHidDevice
+                )
+              : new FlexibleWebUsbTransport(
+                  connectedProbe.device as ConstructorParameters<
+                    typeof DapWebUSB
+                  >[0],
+                  channelLog
+                );
+          channelLog("Programador reconfirmado en el bus\n");
+
+          const session = createCortexTarget(transport);
+          target = session.target;
+          await target.connect();
+          if (targetConfig.algorithm === "py32f0") {
+            await session.dap.configureTransfer(0, PY32_DAP_WAIT_RETRY, 0);
+          }
+          channelLog("SWD conectado\n");
+
+          await target.halt();
+          channelLog("Core detenido\n");
+
+          const callbacks = {
+            addLog: channelLog,
+            setProgress: (nextProgress: number) =>
+              updateProbeProgress(probe.id, nextProgress),
+          };
+
+          if (targetConfig.algorithm === "py32f0") {
+            await flashPy32F0(
+              target,
+              firmwareImage,
+              targetConfig,
+              callbacks
+            );
+          } else {
+            await flashStm32F1(
+              target,
+              firmwareImage,
+              targetConfig,
+              callbacks
+            );
+          }
+
+          await target.softReset();
+          updateProbeProgress(probe.id, 100);
+          updateProbeStatus(probe.id, {
+            state: "success",
+            message: "Programado y verificado",
+          });
+          channelLog("OK: programado, verificado y reiniciado\n");
+          return probe;
+        } catch (err: unknown) {
+          const message = getErrorMessage(err);
+          updateProbeStatus(probe.id, {
+            state: "error",
+            message,
+          });
+          channelLog(`FALLO: ${message}\n`);
+          throw new Error(`${probe.label}: ${message}`, { cause: err });
+        } finally {
+          try {
+            await target?.disconnect();
+          } catch {
+            try {
+              await transport?.close();
+            } catch {
+              // This channel is already closed or unavailable.
+            }
+          }
+        }
+      })
+    );
+
+    const successful = results.filter(
+      (result) => result.status === "fulfilled"
+    ).length;
+    const failedResults = results.filter(
+      (result): result is PromiseRejectedResult =>
+        result.status === "rejected"
+    );
+
+    setProgress(100);
+    addLog(
+      `=== Resultado del lote ${batchName.trim() || "sin referencia"}: ${successful} correctos, ${failedResults.length} fallidos, ${selectedProbes.length} total ===\n`
+    );
+    for (const failedResult of failedResults) {
+      addLog(`- ${getErrorMessage(failedResult.reason)}\n`);
+    }
+    setFlashing(false);
+  }
+
   useEffect(() => {
     if (!showConsole) return;
 
@@ -615,16 +1322,30 @@ export default function CortexProgrammer() {
     logsElement.scrollTop = logsElement.scrollHeight;
   }, [logs, showConsole]);
 
-  const busy = testing || connectingTarget || flashing;
+  const busy = connectingTarget || flashing;
+  const selectedBatchProbeCount = authorizedProbes.filter((probe) =>
+    batchProbeIds.includes(probe.id)
+  ).length;
+  const batchStatusValues = Object.values(batchStatuses);
+  const successfulProbeCount = batchStatusValues.filter(
+    (status) => status.state === "success"
+  ).length;
+  const failedProbeCount = batchStatusValues.filter(
+    (status) => status.state === "error"
+  ).length;
+  const programmingProbeCount = batchStatusValues.filter(
+    (status) => status.state === "programming"
+  ).length;
+  const panelSlots = Array.from(
+    { length: MAX_PANEL_SLOTS },
+    (_, index) => authorizedProbes[index] ?? null
+  );
   const selectedTargetConfig = TARGETS[selectedTarget];
-  const firmwareSize = firmware ? formatBytes(firmware.size) : "No file";
   const statusLabel = flashing
     ? "Programming"
     : connectingTarget
       ? "Connecting"
-      : testing
-        ? "Testing"
-        : "Ready";
+      : "Ready";
   const statusClass = busy
     ? "border-amber-300 bg-amber-50 text-amber-800"
     : "border-emerald-300 bg-emerald-50 text-emerald-800";
@@ -632,181 +1353,164 @@ export default function CortexProgrammer() {
     "rounded-md border px-3 py-2 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-50";
 
   return (
-    <main className="mx-auto min-h-screen w-[min(98vw,1800px)] px-3 py-4 md:px-5">
-      <section className="overflow-hidden rounded-lg border border-slate-300 bg-white shadow-sm">
-        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 bg-slate-50 px-4 py-3">
+    <main className="min-h-[calc(100vh-65px)] w-full">
+      <section className="min-h-[calc(100vh-65px)] overflow-hidden border-y border-slate-800 bg-slate-100">
+        <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-800 bg-slate-950 px-5 py-4 text-white">
           <div>
-            <h1 className="text-lg font-semibold text-slate-950">
-              Programador Cortex
+            <div className="mb-1 text-[11px] font-bold uppercase tracking-[0.18em] text-cyan-400">
+              Cargador de paneles
+            </div>
+            <h1 className="text-xl font-semibold tracking-tight">
+              Consola de producción
             </h1>
-            <p className="text-sm text-slate-500">
-              ARM Cortex por CMSIS-DAP sobre WebHID.
+            <p className="mt-1 text-sm text-slate-400">
+              Receta única · hasta diez sockets · ejecución paralela
             </p>
           </div>
 
-          <div className={`rounded-md border px-3 py-1.5 text-sm font-semibold ${statusClass}`}>
-            {statusLabel}
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2">
+              <div className="text-[10px] font-bold uppercase tracking-wide text-slate-500">
+                Programadores
+              </div>
+              <div className="font-mono text-sm font-bold text-white">
+                {authorizedProbeCount}
+              </div>
+            </div>
+            <div className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2">
+              <div className="text-[10px] font-bold uppercase tracking-wide text-slate-500">
+                Seleccionados
+              </div>
+              <div className="font-mono text-sm font-bold text-cyan-300">
+                {selectedBatchProbeCount}
+              </div>
+            </div>
+            <div className={`rounded-lg border px-3 py-2 text-sm font-bold ${statusClass}`}>
+              {statusLabel}
+            </div>
           </div>
         </div>
 
-        <div className="grid gap-4 p-4 lg:grid-cols-[minmax(0,1fr)_380px]">
-          <div className="grid gap-4">
-            <div className="rounded-lg border border-slate-200 bg-white p-3">
-              <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_280px]">
-                <div>
-                  <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500">
-                    Familia
+        <div className="grid min-w-0 gap-0 xl:grid-cols-[390px_minmax(0,1fr)]">
+          <div className="grid min-w-0 content-start gap-4">
+            <div className="border-b border-r border-slate-300 bg-white p-4">
+              <div className="mb-4">
+                <div className="text-[11px] font-bold uppercase tracking-[0.16em] text-cyan-700">
+                  Receta de carga
+                </div>
+                <div className="mt-0.5 text-lg font-semibold text-slate-950">
+                  Configuración del trabajo
+                </div>
+              </div>
+              <label className="mb-4 block min-w-0">
+                <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                  Lote / orden de producción
+                </div>
+                <input
+                  className="w-full rounded-md border border-slate-300 bg-slate-50 px-3 py-2.5 font-mono text-sm font-semibold text-slate-950 outline-none placeholder:text-slate-400 focus:border-cyan-500 focus:ring-2 focus:ring-cyan-100"
+                  disabled={busy}
+                  onChange={(event) => setBatchName(event.target.value)}
+                  placeholder="Ej. OP-2026-0042"
+                  type="text"
+                  value={batchName}
+                />
+              </label>
+              <div className="mb-4">
+                <div className="mb-1.5 flex items-center justify-between gap-2">
+                  <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                    Filtrar objetivos
                   </div>
-                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
-                    {FAMILY_FILTERS.map((family) => (
-                      <button
-                        className={`rounded-md border px-3 py-2 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 ${
-                          familyFilter === family.id
-                            ? "border-cyan-400 bg-cyan-50 text-cyan-950"
-                            : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
-                        }`}
-                        disabled={busy}
-                        key={family.id}
-                        onClick={() => selectFamily(family.id)}
-                        type="button"
-                      >
-                        {family.label}
-                      </button>
-                    ))}
+                  <div className="text-[10px] font-medium text-slate-400">
+                    {filteredTargetEntries.length} resultados
                   </div>
                 </div>
-
-                <label className="min-w-0">
-                  <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500">
-                    Buscar
-                  </div>
-                  <input
-                    className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-950 placeholder:text-slate-400"
-                    disabled={busy}
-                    onChange={(event) => setTargetSearch(event.target.value)}
-                    placeholder="py32f003, stm32, gd32..."
-                    type="search"
-                    value={targetSearch}
-                  />
-                </label>
+                <div className="grid grid-cols-4 gap-1">
+                  {FAMILY_FILTERS.map((family) => (
+                    <button
+                      className={`rounded border px-1.5 py-1 text-[11px] font-bold transition disabled:opacity-50 ${
+                        familyFilter === family.id
+                          ? "border-cyan-500 bg-cyan-50 text-cyan-900"
+                          : "border-slate-300 bg-white text-slate-600 hover:border-slate-400"
+                      }`}
+                      disabled={busy}
+                      key={family.id}
+                      onClick={() => selectFamily(family.id)}
+                      type="button"
+                    >
+                      {family.label}
+                    </button>
+                  ))}
+                </div>
+                <input
+                  className="mt-1.5 w-full rounded border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-900 outline-none placeholder:text-slate-400 focus:border-cyan-500"
+                  disabled={busy}
+                  onChange={(event) => setTargetSearch(event.target.value)}
+                  placeholder="Buscar target..."
+                  type="search"
+                  value={targetSearch}
+                />
               </div>
-            </div>
-
-            <div className="grid gap-3 md:grid-cols-3">
-              <div className="rounded-lg border border-slate-200 bg-white p-3">
-                <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
-                  Target
+              <label className="block min-w-0">
+                <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                  Microcontrolador objetivo
                 </div>
                 <select
-                  className="mt-2 w-full rounded-md border border-slate-300 bg-white px-2 py-2 text-sm font-semibold text-slate-950"
+                  className="w-full rounded-md border border-slate-300 bg-white px-3 py-2.5 text-sm font-semibold text-slate-950"
                   disabled={busy || filteredTargetEntries.length === 0}
-                  onChange={(event) => setSelectedTarget(event.target.value as TargetKey)}
+                  onChange={(event) =>
+                    setSelectedTarget(event.target.value as TargetKey)
+                  }
                   value={selectedTargetAvailable ? selectedTarget : ""}
                 >
-                  {filteredTargetEntries.length === 0 ? (
-                    <option value="">Sin targets disponibles</option>
-                  ) : selectedTargetAvailable ? null : (
-                    <option value="">Selecciona un target</option>
-                  )}
+                  {!selectedTargetAvailable ? (
+                    <option value="">
+                      {filteredTargetEntries.length === 0
+                        ? "Sin resultados"
+                        : "Selecciona un objetivo"}
+                    </option>
+                  ) : null}
                   {filteredTargetEntries.map(([key, target]) => (
                     <option key={key} value={key}>
                       {target.label}
                     </option>
                   ))}
                 </select>
-                <div className="mt-1 text-sm text-slate-500">
-                  {filteredTargetEntries.length === 0
-                    ? "Familia sin soporte de flash web por ahora."
-                    : selectedTargetAvailable
-                      ? selectedTargetConfig.description
-                      : "Elige un target de la lista filtrada."}
-                </div>
-              </div>
-
-              <div className="rounded-lg border border-slate-200 bg-white p-3">
-                <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
-                  Flash
-                </div>
-                <div className="mt-2 font-mono text-sm font-semibold text-slate-950">
+                <div className="mt-1.5 text-xs text-slate-500">
                   {selectedTargetAvailable
-                    ? formatHex32(selectedTargetConfig.flashBase)
-                    : "--"}
+                    ? selectedTargetConfig.description
+                    : "Selecciona un objetivo de los resultados filtrados."}
                 </div>
-                <div className="mt-1 text-sm text-slate-500">
-                  {selectedTargetAvailable ? (
-                    <>
-                      Erase: {formatBytes(selectedTargetConfig.pageSize)}
-                      {"programPageSize" in selectedTargetConfig
-                        ? `, program: ${formatBytes(selectedTargetConfig.programPageSize)}`
-                        : ""}
-                    </>
-                  ) : (
-                    "Sin target seleccionado"
-                  )}
-                </div>
-              </div>
-
-              <div className="rounded-lg border border-slate-200 bg-white p-3">
-                <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
-                  Firmware
-                </div>
-                <div className="mt-2 truncate text-sm font-semibold text-slate-950">
-                  {firmwareName || "No firmware selected"}
-                </div>
-                <div className="mt-1 text-sm text-slate-500">{firmwareSize}</div>
-              </div>
+              </label>
             </div>
 
-            <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+            <div className="mx-4 rounded-lg border border-slate-300 bg-white p-3">
               <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500">
-                Firmware binary / ELF
+                Firmware
               </div>
-              <div className="grid gap-2 sm:grid-cols-[auto_minmax(0,1fr)]">
-                <button
-                  className="rounded-md border border-slate-900 bg-slate-950 px-3 py-2 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
-                  disabled={busy}
-                  onClick={() => {
-                    void pickFirmwareFile();
-                  }}
-                  type="button"
-                >
-                  Select tracked firmware
-                </button>
-
-                <label className="min-w-0">
-                  <input
-                    accept=".bin,.elf"
-                    className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 file:mr-3 file:rounded-md file:border-0 file:bg-slate-200 file:px-3 file:py-2 file:text-sm file:font-semibold file:text-slate-800 hover:file:bg-slate-300"
-                    disabled={busy}
-                    onClick={(event) => {
-                      event.currentTarget.value = "";
-                    }}
-                    onChange={(event) => {
-                      const selectedFirmware = event.target.files?.[0] ?? null;
-                      void setSelectedFirmware(selectedFirmware, null).catch(
-                        (err: unknown) => {
-                          addLog(
-                            `Firmware read error: ${getErrorMessage(err)}\n`
-                          );
-                        }
-                      );
-                    }}
-                    type="file"
-                  />
-                </label>
-              </div>
-              <div className="mt-2 rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700">
-                Selected:{" "}
-                <span className="font-semibold text-slate-950">
-                  {firmwareName || "none"}
-                </span>
+              <button
+                className="w-full rounded-md border border-slate-900 bg-slate-950 px-3 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={busy}
+                onClick={() => {
+                  void pickFirmwareFile();
+                }}
+                type="button"
+              >
+                Seleccionar firmware
+              </button>
+              <div className="mt-2 min-w-0 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-sm">
+                <div className="truncate font-semibold text-slate-950">
+                  {firmwareName || "Ningún archivo seleccionado"}
+                </div>
+                <div className="mt-0.5 text-xs text-slate-500">
+                  {firmware ? formatBytes(firmware.size) : ".bin o .elf"}
+                </div>
               </div>
               <div className="mt-2 text-xs text-slate-500">
-                Select tracked mantiene el archivo para leerlo fresco en cada flash.
+                El archivo se vuelve a leer al iniciar cada ciclo.
               </div>
             </div>
 
-            <div className="rounded-lg border border-slate-200 bg-white p-3">
+            <div className="mx-4 mb-4 rounded-lg border border-slate-300 bg-white p-3">
               <div className="mb-2 flex items-center justify-between gap-3">
                 <div className="text-sm font-semibold text-slate-800">
                   Progress
@@ -824,51 +1528,333 @@ export default function CortexProgrammer() {
             </div>
           </div>
 
-          <aside className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-            <div className="mb-3 text-sm font-semibold text-slate-900">
-              Actions
+          <aside className="min-w-0 bg-slate-100 p-4 lg:p-5">
+            <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <div className="text-[11px] font-bold uppercase tracking-[0.16em] text-cyan-700">
+                  Fixture de programación
+                </div>
+                <div className="mt-0.5 text-lg font-semibold text-slate-950">
+                  Panel de hasta diez posiciones
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <div className="rounded-full border border-slate-200 bg-slate-100 px-3 py-1 font-mono text-xs font-bold text-slate-700">
+                  {selectedBatchProbeCount}/{MAX_PANEL_SLOTS} sockets activos
+                </div>
+                <button
+                  className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-bold text-slate-700 shadow-sm transition hover:border-cyan-500 hover:text-cyan-800 disabled:cursor-wait disabled:opacity-60"
+                  disabled={busy || scanningProbes}
+                  onClick={() =>
+                    void scanAuthorizedProbes("Reescaneo manual")
+                  }
+                  type="button"
+                >
+                  {scanningProbes ? "Escaneando..." : "Reescanear"}
+                </button>
+              </div>
             </div>
-            <div className="grid gap-2">
-              <button
-                className={`${buttonBase} border-slate-300 bg-white text-slate-800 hover:bg-slate-100`}
-                disabled={busy}
-                onClick={testCmsisDap}
-                type="button"
+            <div className="grid gap-3">
+              <details className="group min-w-0 rounded-lg border border-slate-200 bg-slate-50">
+                <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3 py-2.5 text-sm font-semibold text-slate-700">
+                  <span>Conexión individual y autorización</span>
+                  <span className="text-slate-400 transition group-open:rotate-180">
+                    ▾
+                  </span>
+                </summary>
+                <div className="grid gap-2 border-t border-slate-200 p-3">
+              <div
+                className={
+                  detectedProbe
+                    ? "min-w-0 rounded-md border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm text-emerald-900"
+                    : "min-w-0 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-500"
+                }
               >
-                {testing ? "Testing CMSIS-DAP..." : "Test CMSIS-DAP"}
-              </button>
+                <div className="text-xs font-semibold uppercase tracking-wide">
+                  Programador
+                </div>
+                <div className="mt-0.5 break-words font-medium">
+                  {detectedProbe
+                    ? `Detectado: ${detectedProbe}`
+                    : authorizedProbeCount > 1
+                      ? `${authorizedProbeCount} programadores autorizados; pulsa Connect Cortex para elegir`
+                    : "No autorizado todavía; pulsa Connect Cortex"}
+                </div>
+              </div>
+
+              <label className="grid min-w-0 gap-1 text-xs font-semibold uppercase tracking-wide text-slate-600">
+                Programador CMSIS-DAP
+                <select
+                  className="w-full min-w-0 max-w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-medium normal-case tracking-normal text-slate-800"
+                  disabled={busy}
+                  onChange={(event) => {
+                    const probeId = event.target.value;
+                    const probe =
+                      authorizedProbes.find(
+                        (candidate) => candidate.id === probeId
+                      ) ?? null;
+                    setSelectedProbeId(probeId);
+                    setDetectedProbe(probe?.label ?? "");
+                    if (probe) setCmsisTransport("auto");
+                  }}
+                  value={selectedProbeId}
+                >
+                  <option value="">
+                    {authorizedProbes.length > 0
+                      ? "Seleccionar o autorizar otro..."
+                      : "Autorizar un programador nuevo..."}
+                  </option>
+                  {authorizedProbes.map((probe) => (
+                    <option key={probe.id} value={probe.id}>
+                      {probe.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="grid min-w-0 gap-1 text-xs font-semibold uppercase tracking-wide text-slate-600">
+                Transporte CMSIS-DAP
+                <select
+                  className="w-full min-w-0 max-w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-medium normal-case tracking-normal text-slate-800"
+                  disabled={busy}
+                  onChange={(event) =>
+                    setCmsisTransport(event.target.value as CmsisTransportKind)
+                  }
+                  value={cmsisTransport}
+                >
+                  <option value="auto">Automático (v1 / v2)</option>
+                  <option value="webhid">WebHID (CMSIS-DAP v1 / QinHeng)</option>
+                  <option value="webusb">WebUSB (CMSIS-DAP v2)</option>
+                </select>
+              </label>
+                </div>
+              </details>
+
+              <fieldset className="min-w-0 rounded-lg border border-slate-200 bg-slate-50/70 p-3">
+                <legend className="px-1 text-xs font-bold uppercase tracking-[0.12em] text-slate-500">
+                  Canales disponibles
+                </legend>
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      className="rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700 shadow-sm hover:border-cyan-400 hover:text-cyan-800"
+                      disabled={busy || authorizedProbes.length === 0}
+                      onClick={() =>
+                        setBatchProbeIds(
+                          panelSlots
+                            .filter(
+                              (probe): probe is AuthorizedCmsisProbe =>
+                                probe !== null
+                            )
+                            .map((probe) => probe.id)
+                        )
+                      }
+                      type="button"
+                    >
+                      Activar conectados
+                    </button>
+                    <button
+                      className="rounded-md border border-transparent px-2.5 py-1.5 text-xs font-semibold text-slate-500 hover:bg-slate-200/70 hover:text-slate-800"
+                      disabled={busy || batchProbeIds.length === 0}
+                      onClick={() => setBatchProbeIds([])}
+                      type="button"
+                    >
+                      Desactivar
+                    </button>
+                  </div>
+                  <div className="text-xs font-medium text-slate-500">
+                    {authorizedProbes.length} conectados
+                  </div>
+                </div>
+                <div className="grid min-w-0 gap-3 md:grid-cols-2 min-[1280px]:grid-cols-3">
+                  {panelSlots.map((probe, slotIndex) => {
+                    if (!probe) {
+                      return (
+                        <div
+                          className="grid min-h-36 place-items-center rounded-lg border border-dashed border-slate-300 bg-slate-100/60 p-4 text-center"
+                          key={`empty-slot-${slotIndex}`}
+                        >
+                          <div>
+                            <div className="mx-auto mb-2 grid size-8 place-items-center rounded-full border border-slate-300 bg-white font-mono text-xs font-bold text-slate-400">
+                              {slotIndex + 1}
+                            </div>
+                            <div className="text-sm font-semibold text-slate-500">
+                              Socket vacío
+                            </div>
+                            <div className="mt-1 text-xs text-slate-400">
+                              Autoriza o conecta un CMSIS-DAP
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    }
+
+                        const probeStatus = batchStatuses[probe.id];
+                        const statusClassName =
+                          probeStatus?.state === "success"
+                            ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+                            : probeStatus?.state === "error"
+                              ? "border-red-200 bg-red-50 text-red-800"
+                              : probeStatus?.state === "programming"
+                                ? "border-amber-200 bg-amber-50 text-amber-800"
+                                : "border-slate-200 bg-slate-50 text-slate-700";
+
+                        return (
+                          <label
+                            className={`relative grid min-h-36 min-w-0 cursor-pointer content-between gap-3 rounded-lg border p-4 text-xs shadow-sm transition hover:-translate-y-0.5 hover:shadow ${statusClassName}`}
+                            key={probe.id}
+                          >
+                            <span className="absolute right-3 top-3 grid size-7 place-items-center rounded-full border border-current/15 bg-white/70 font-mono text-[11px] font-bold opacity-70">
+                              {slotIndex + 1}
+                            </span>
+                            <span className="flex min-w-0 items-start gap-2">
+                              <input
+                                checked={batchProbeIds.includes(probe.id)}
+                                className="mt-0.5 shrink-0"
+                                disabled={busy}
+                                onChange={(event) =>
+                                  setBatchProbeIds((current) =>
+                                    event.target.checked
+                                      ? [...current, probe.id]
+                                      : current.filter(
+                                          (probeId) => probeId !== probe.id
+                                        )
+                                  )
+                                }
+                                type="checkbox"
+                              />
+                              <span className="min-w-0">
+                                <span className="block break-words pr-8 text-sm font-bold leading-snug">
+                                  {probe.label.split(" · ")[0]}
+                                </span>
+                                <span className="mt-1 block break-words font-mono text-[10px] font-medium opacity-75">
+                                  {probe.label.split(" · ").slice(1).join(" · ")}
+                                </span>
+                              </span>
+                            </span>
+                            {probeStatus ? (
+                              <>
+                                <span className="break-words pl-6 font-semibold">
+                                  {probeStatus.state === "success"
+                                    ? "Correcto"
+                                    : probeStatus.state === "error"
+                                      ? `Falló: ${probeStatus.message}`
+                                      : probeStatus.state === "programming"
+                                        ? `Programando ${probeStatus.progress.toFixed(0)}%`
+                                        : "En espera"}
+                                </span>
+                                <span className="ml-6 h-1.5 overflow-hidden rounded-full bg-white/80">
+                                  <span
+                                    className={`block h-full rounded-full ${
+                                      probeStatus.state === "error"
+                                        ? "bg-red-500"
+                                        : probeStatus.state === "success"
+                                          ? "bg-emerald-500"
+                                          : "bg-cyan-500"
+                                    }`}
+                                    style={{
+                                      width: `${probeStatus.progress}%`,
+                                    }}
+                                  />
+                                </span>
+                              </>
+                            ) : null}
+                          </label>
+                        );
+                      })}
+                </div>
+              </fieldset>
+
+              <div className="grid grid-cols-3 overflow-hidden rounded-lg border border-slate-200 bg-white">
+                <div className="border-r border-slate-200 px-2 py-2.5 text-center">
+                  <div className="font-mono text-lg font-bold text-emerald-600">
+                    {successfulProbeCount}
+                  </div>
+                  <div className="text-[10px] font-bold uppercase tracking-wide text-slate-400">
+                    OK
+                  </div>
+                </div>
+                <div className="border-r border-slate-200 px-2 py-2.5 text-center">
+                  <div className="font-mono text-lg font-bold text-amber-600">
+                    {programmingProbeCount}
+                  </div>
+                  <div className="text-[10px] font-bold uppercase tracking-wide text-slate-400">
+                    Procesando
+                  </div>
+                </div>
+                <div className="px-2 py-2.5 text-center">
+                  <div className="font-mono text-lg font-bold text-red-600">
+                    {failedProbeCount}
+                  </div>
+                  <div className="text-[10px] font-bold uppercase tracking-wide text-slate-400">
+                    Rechazo
+                  </div>
+                </div>
+              </div>
 
               <button
-                className={`${buttonBase} border-cyan-300 bg-cyan-50 text-cyan-900 hover:bg-cyan-100`}
-                disabled={busy || !selectedTargetAvailable}
-                onClick={connectCortexTarget}
+                className={`${buttonBase} min-h-12 border-cyan-500 bg-cyan-400 text-base text-slate-950 shadow-sm hover:border-cyan-300 hover:bg-cyan-300`}
+                disabled={
+                  busy ||
+                  !firmware ||
+                  !selectedTargetAvailable ||
+                  selectedBatchProbeCount === 0
+                }
+                onClick={flashCortexFirmwareBatch}
                 type="button"
               >
-                {connectingTarget ? "Connecting target..." : "Connect Cortex"}
+                {flashing
+                  ? "Ciclo en ejecución..."
+                  : `Iniciar ciclo · ${selectedBatchProbeCount} posición${selectedBatchProbeCount === 1 ? "" : "es"}`}
               </button>
 
-              <button
-                className={`${buttonBase} border-slate-900 bg-slate-950 text-white hover:bg-slate-800`}
-                disabled={busy || !firmware || !selectedTargetAvailable}
-                onClick={flashCortexFirmware}
-                type="button"
-              >
-                {flashing ? "Flashing Cortex..." : "Flash Cortex"}
-              </button>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  className={`${buttonBase} border-slate-300 bg-white text-slate-700 hover:border-cyan-400 hover:text-cyan-800`}
+                  disabled={busy || !selectedTargetAvailable}
+                  onClick={connectCortexTarget}
+                  type="button"
+                >
+                  {connectingTarget ? "Conectando..." : "Probar uno"}
+                </button>
 
-              <button
-                className={`${buttonBase} border-slate-300 bg-white text-slate-700 hover:bg-slate-100`}
-                disabled={busy || logs.length === 0}
-                onClick={() => setLogs("")}
-                type="button"
-              >
-                Clear log
-              </button>
+                <button
+                  className={`${buttonBase} border-slate-700 bg-slate-800 text-white hover:bg-slate-700`}
+                  disabled={busy || !firmware || !selectedTargetAvailable}
+                  onClick={flashCortexFirmware}
+                  type="button"
+                >
+                  {flashing ? "Programando..." : "Programar uno"}
+                </button>
+              </div>
             </div>
 
-            <div className="mt-4 rounded-md border border-slate-200 bg-white p-3 text-sm text-slate-600">
-              Raw `.bin` se escribe en <span className="font-mono">0x08000000</span>.
-              El flujo usa el algoritmo configurado para el target seleccionado y verifica la flash.
+            <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-3">
+              <div className="mb-2 text-[11px] font-bold uppercase tracking-[0.12em] text-slate-500">
+                Trabajo actual
+              </div>
+              <dl className="grid gap-1.5 text-xs">
+                <div className="flex items-start justify-between gap-3">
+                  <dt className="text-slate-500">Lote</dt>
+                  <dd className="max-w-[70%] truncate text-right font-mono font-semibold text-slate-800">
+                    {batchName.trim() || "Sin referencia"}
+                  </dd>
+                </div>
+                <div className="flex items-start justify-between gap-3">
+                  <dt className="text-slate-500">Target</dt>
+                  <dd className="text-right font-semibold text-slate-800">
+                    {selectedTargetAvailable
+                      ? selectedTargetConfig.label
+                      : "Sin seleccionar"}
+                  </dd>
+                </div>
+                <div className="flex items-start justify-between gap-3">
+                  <dt className="text-slate-500">Firmware</dt>
+                  <dd className="max-w-[70%] truncate text-right font-semibold text-slate-800">
+                    {firmwareName || "Sin archivo"}
+                  </dd>
+                </div>
+              </dl>
             </div>
           </aside>
         </div>
@@ -884,13 +1870,23 @@ export default function CortexProgrammer() {
               </div>
             </div>
 
-            <button
-              className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-sm font-semibold text-slate-100 transition hover:bg-slate-800"
-              onClick={() => setShowConsole((current) => !current)}
-              type="button"
-            >
-              {showConsole ? "Ocultar consola" : "Mostrar consola"}
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-sm font-semibold text-slate-100 transition hover:bg-slate-800 disabled:opacity-50"
+                disabled={busy || logs.length === 0}
+                onClick={() => setLogs("")}
+                type="button"
+              >
+                Limpiar
+              </button>
+              <button
+                className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-sm font-semibold text-slate-100 transition hover:bg-slate-800"
+                onClick={() => setShowConsole((current) => !current)}
+                type="button"
+              >
+                {showConsole ? "Ocultar consola" : "Mostrar consola"}
+              </button>
+            </div>
           </div>
 
           {showConsole ? (

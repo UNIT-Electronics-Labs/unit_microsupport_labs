@@ -18,6 +18,7 @@ import {
 } from "../cortex/utils";
 
 const CORTEX_CPUID_ADDRESS = 0xe000ed00;
+const CMSIS_DAP_SWD_CLOCK_HZ = 1_000_000;
 const MAX_PANEL_SLOTS = 10;
 const probeInstanceIds = new WeakMap<object, number>();
 let nextProbeInstanceId = 1;
@@ -96,6 +97,20 @@ type WindowWithFilePicker = Window & {
 
 function formatUsbId(value?: number): string {
   return value === undefined ? "????" : value.toString(16).padStart(4, "0");
+}
+
+function getCortexProbeErrorMessage(error: unknown): string {
+  const message = getErrorMessage(error);
+
+  if (message.includes("Transfer count mismatch")) {
+    return (
+      "El target no completó la transferencia SWD. Revisa Vref/3.3 V, " +
+      "GND común, SWDIO, SWCLK y NRST; usa cables cortos. La prueba está " +
+      `configurada a ${CMSIS_DAP_SWD_CLOCK_HZ / 1_000_000} MHz.`
+    );
+  }
+
+  return message;
 }
 
 const KNOWN_CMSIS_DAP_IDS: Array<{ vendorId: number; productId?: number }> = [
@@ -400,7 +415,11 @@ function createCortexTarget(transport: DapTransport): {
   dap: CmsisDAP;
   target: CortexM;
 } {
-  const dap = new CmsisDAP(transport);
+  const dap = new CmsisDAP(
+    transport,
+    undefined,
+    CMSIS_DAP_SWD_CLOCK_HZ
+  );
   return {
     dap,
     target: new CortexM(dap),
@@ -1180,7 +1199,7 @@ export default function CortexProgrammer() {
       addLog("Cortex target probe finished\n");
     } catch (err: unknown) {
       console.error(err);
-      addLog(`Cortex target error: ${getErrorMessage(err)}\n`);
+      addLog(`Cortex target error: ${getCortexProbeErrorMessage(err)}\n`);
     } finally {
       try {
         await target?.disconnect();
@@ -1292,7 +1311,7 @@ export default function CortexProgrammer() {
           });
           return probe;
         } catch (err: unknown) {
-          const message = getErrorMessage(err);
+          const message = getCortexProbeErrorMessage(err);
           updateProbeStatus(probe.id, {
             state: "error",
             progress: 100,
@@ -1407,7 +1426,7 @@ export default function CortexProgrammer() {
       addLog("Target reset\n");
     } catch (err: unknown) {
       console.error(err);
-      addLog(`Flash Cortex error: ${getErrorMessage(err)}\n`);
+      addLog(`Flash Cortex error: ${getCortexProbeErrorMessage(err)}\n`);
     } finally {
       try {
         await target?.disconnect();
@@ -1588,7 +1607,7 @@ export default function CortexProgrammer() {
           channelLog("OK: programado, verificado y reiniciado\n");
           return probe;
         } catch (err: unknown) {
-          const message = getErrorMessage(err);
+          const message = getCortexProbeErrorMessage(err);
           updateProbeStatus(probe.id, {
             state: "error",
             message,

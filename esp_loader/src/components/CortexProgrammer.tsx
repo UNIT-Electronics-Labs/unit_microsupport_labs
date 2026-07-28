@@ -18,7 +18,7 @@ import {
 } from "../cortex/utils";
 
 const CORTEX_CPUID_ADDRESS = 0xe000ed00;
-const CMSIS_DAP_SWD_CLOCK_HZ = 1_000_000;
+const DEFAULT_SWD_CLOCK_HZ = 1_000_000;
 const MAX_PANEL_SLOTS = 10;
 const probeInstanceIds = new WeakMap<object, number>();
 let nextProbeInstanceId = 1;
@@ -58,6 +58,16 @@ const FAMILY_FILTERS = [
   { id: "py32", label: "PY32" },
   { id: "gd32", label: "GD32" },
 ] as const satisfies ReadonlyArray<{ id: FamilyFilter; label: string }>;
+
+const SWD_CLOCK_OPTIONS = [
+  { value: 100_000, label: "100 kHz · máxima estabilidad" },
+  { value: 500_000, label: "500 kHz" },
+  { value: 1_000_000, label: "1 MHz · recomendado" },
+  { value: 2_000_000, label: "2 MHz" },
+  { value: 4_000_000, label: "4 MHz" },
+  { value: 8_000_000, label: "8 MHz" },
+  { value: 10_000_000, label: "10 MHz · máxima velocidad" },
+] as const;
 
 type WebHidInputReportEvent = Event & {
   data: DataView;
@@ -99,14 +109,23 @@ function formatUsbId(value?: number): string {
   return value === undefined ? "????" : value.toString(16).padStart(4, "0");
 }
 
-function getCortexProbeErrorMessage(error: unknown): string {
+function formatSwdClock(clockHz: number): string {
+  return clockHz >= 1_000_000
+    ? `${clockHz / 1_000_000} MHz`
+    : `${clockHz / 1_000} kHz`;
+}
+
+function getCortexProbeErrorMessage(
+  error: unknown,
+  swdClockHz: number
+): string {
   const message = getErrorMessage(error);
 
   if (message.includes("Transfer count mismatch")) {
     return (
       "El target no completó la transferencia SWD. Revisa Vref/3.3 V, " +
       "GND común, SWDIO, SWCLK y NRST; usa cables cortos. La prueba está " +
-      `configurada a ${CMSIS_DAP_SWD_CLOCK_HZ / 1_000_000} MHz.`
+      `configurada a ${formatSwdClock(swdClockHz)}.`
     );
   }
 
@@ -411,14 +430,17 @@ class FlexibleWebUsbTransport implements DapTransport {
   }
 }
 
-function createCortexTarget(transport: DapTransport): {
+function createCortexTarget(
+  transport: DapTransport,
+  swdClockHz: number
+): {
   dap: CmsisDAP;
   target: CortexM;
 } {
   const dap = new CmsisDAP(
     transport,
     undefined,
-    CMSIS_DAP_SWD_CLOCK_HZ
+    swdClockHz
   );
   return {
     dap,
@@ -430,6 +452,7 @@ export default function CortexProgrammer() {
   const [selectedTarget, setSelectedTarget] = useState<TargetKey>("stm32f103rc");
   const [familyFilter, setFamilyFilter] = useState<FamilyFilter>("all");
   const [targetSearch, setTargetSearch] = useState("");
+  const [swdClockHz, setSwdClockHz] = useState(DEFAULT_SWD_CLOCK_HZ);
   const [cmsisTransport, setCmsisTransport] =
     useState<CmsisTransportKind>("auto");
   const [detectedProbe, setDetectedProbe] = useState("");
@@ -1141,7 +1164,9 @@ export default function CortexProgrammer() {
     }
 
     setConnectingTarget(true);
-    addLog("\nConnecting to Cortex target over SWD...\n");
+    addLog(
+      `\nConnecting to Cortex target over SWD at ${formatSwdClock(swdClockHz)}...\n`
+    );
 
     let transport: DapTransport | null = null;
     let target: CortexM | null = null;
@@ -1150,7 +1175,7 @@ export default function CortexProgrammer() {
       transport = await requestCmsisDapTransport();
       if (!transport) return;
 
-      const session = createCortexTarget(transport);
+      const session = createCortexTarget(transport, swdClockHz);
       target = session.target;
       await target.connect();
       const targetConfig = TARGETS[selectedTarget];
@@ -1199,7 +1224,9 @@ export default function CortexProgrammer() {
       addLog("Cortex target probe finished\n");
     } catch (err: unknown) {
       console.error(err);
-      addLog(`Cortex target error: ${getCortexProbeErrorMessage(err)}\n`);
+      addLog(
+        `Cortex target error: ${getCortexProbeErrorMessage(err, swdClockHz)}\n`
+      );
     } finally {
       try {
         await target?.disconnect();
@@ -1258,7 +1285,7 @@ export default function CortexProgrammer() {
     setProgress(0);
     setBatchStatuses(initialStatuses);
     addLog(
-      `\n=== Prueba de panel: ${selectedProbes.length} canal(es), target ${targetConfig.label} ===\n`
+      `\n=== Prueba de panel: ${selectedProbes.length} canal(es), target ${targetConfig.label}, SWD ${formatSwdClock(swdClockHz)} ===\n`
     );
 
     const results = await Promise.allSettled(
@@ -1288,7 +1315,7 @@ export default function CortexProgrammer() {
                   channelLog
                 );
 
-          const session = createCortexTarget(transport);
+          const session = createCortexTarget(transport, swdClockHz);
           target = session.target;
           await target.connect();
           if (targetConfig.algorithm === "py32f0") {
@@ -1311,7 +1338,7 @@ export default function CortexProgrammer() {
           });
           return probe;
         } catch (err: unknown) {
-          const message = getCortexProbeErrorMessage(err);
+          const message = getCortexProbeErrorMessage(err, swdClockHz);
           updateProbeStatus(probe.id, {
             state: "error",
             progress: 100,
@@ -1367,7 +1394,9 @@ export default function CortexProgrammer() {
 
     setFlashing(true);
     setProgress(0);
-    addLog(`\nFlashing Cortex firmware: ${selectedFirmware.name}\n`);
+    addLog(
+      `\nFlashing Cortex firmware: ${selectedFirmware.name} · SWD ${formatSwdClock(swdClockHz)}\n`
+    );
 
     let transport: DapTransport | null = null;
     let target: CortexM | null = null;
@@ -1394,7 +1423,7 @@ export default function CortexProgrammer() {
       transport = await requestCmsisDapTransport();
       if (!transport) return;
 
-      const session = createCortexTarget(transport);
+      const session = createCortexTarget(transport, swdClockHz);
       target = session.target;
       await target.connect();
       if (targetConfig.algorithm === "py32f0") {
@@ -1426,7 +1455,9 @@ export default function CortexProgrammer() {
       addLog("Target reset\n");
     } catch (err: unknown) {
       console.error(err);
-      addLog(`Flash Cortex error: ${getCortexProbeErrorMessage(err)}\n`);
+      addLog(
+        `Flash Cortex error: ${getCortexProbeErrorMessage(err, swdClockHz)}\n`
+      );
     } finally {
       try {
         await target?.disconnect();
@@ -1508,7 +1539,7 @@ export default function CortexProgrammer() {
     setProgress(0);
     setBatchStatuses(initialStatuses);
     addLog(
-      `\n=== Lote ${batchName.trim() || "sin referencia"}: ${selectedProbes.length} canal(es), ${selectedFirmware.name} ===\n`
+      `\n=== Lote ${batchName.trim() || "sin referencia"}: ${selectedProbes.length} canal(es), ${selectedFirmware.name}, SWD ${formatSwdClock(swdClockHz)} ===\n`
     );
 
     const updateProbeStatus = (
@@ -1565,7 +1596,7 @@ export default function CortexProgrammer() {
                 );
           channelLog("Programador reconfirmado en el bus\n");
 
-          const session = createCortexTarget(transport);
+          const session = createCortexTarget(transport, swdClockHz);
           target = session.target;
           await target.connect();
           if (targetConfig.algorithm === "py32f0") {
@@ -1607,7 +1638,7 @@ export default function CortexProgrammer() {
           channelLog("OK: programado, verificado y reiniciado\n");
           return probe;
         } catch (err: unknown) {
-          const message = getCortexProbeErrorMessage(err);
+          const message = getCortexProbeErrorMessage(err, swdClockHz);
           updateProbeStatus(probe.id, {
             state: "error",
             message,
@@ -1814,6 +1845,34 @@ export default function CortexProgrammer() {
                   {selectedTargetAvailable
                     ? selectedTargetConfig.description
                     : "Selecciona un objetivo de los resultados filtrados."}
+                </div>
+              </label>
+              <label className="mt-3 block min-w-0">
+                <div className="mb-1.5 flex items-center justify-between gap-2">
+                  <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                    Velocidad SWD
+                  </span>
+                  <span className="font-mono text-[10px] font-bold text-cyan-700">
+                    {formatSwdClock(swdClockHz)}
+                  </span>
+                </div>
+                <select
+                  className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-950"
+                  disabled={busy}
+                  onChange={(event) =>
+                    setSwdClockHz(Number(event.target.value))
+                  }
+                  value={swdClockHz}
+                >
+                  {SWD_CLOCK_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+                <div className="mt-1.5 text-xs text-slate-500">
+                  Baja la frecuencia para cables largos o paneles con señal
+                  SWD débil; súbela cuando el fixture sea estable.
                 </div>
               </label>
             </div>
@@ -2326,6 +2385,12 @@ export default function CortexProgrammer() {
                     {selectedTargetAvailable
                       ? selectedTargetConfig.label
                       : "Sin seleccionar"}
+                  </dd>
+                </div>
+                <div className="flex items-start justify-between gap-3">
+                  <dt className="text-slate-500">SWD</dt>
+                  <dd className="font-mono font-semibold text-slate-800">
+                    {formatSwdClock(swdClockHz)}
                   </dd>
                 </div>
                 <div className="flex items-start justify-between gap-3">

@@ -98,13 +98,6 @@ type FileSystemFileHandleLike = {
   requestPermission?: (descriptor?: { mode?: "read" }) => Promise<PermissionState>;
 };
 
-type WindowWithFilePicker = Window & {
-  showOpenFilePicker?: (options?: {
-    excludeAcceptAllOption?: boolean;
-    multiple?: boolean;
-  }) => Promise<FileSystemFileHandleLike[]>;
-};
-
 function formatUsbId(value?: number): string {
   return value === undefined ? "????" : value.toString(16).padStart(4, "0");
 }
@@ -712,25 +705,6 @@ export default function CortexProgrammer() {
         `Cortex firmware selected: ${file.name} (${formatBytes(file.size)})\n`
       );
     }
-  }
-
-  async function pickFirmwareFile() {
-    const picker = (window as WindowWithFilePicker).showOpenFilePicker;
-
-    if (!picker) {
-      addLog("File picker handle API is not available; use the file input.\n");
-      return;
-    }
-
-    const [handle] = await picker({
-      excludeAcceptAllOption: false,
-      multiple: false,
-    });
-
-    if (!handle) return;
-
-    const file = await handle.getFile();
-    await setSelectedFirmware(file, handle);
   }
 
   async function askFirmwareForFlash(): Promise<{
@@ -1881,16 +1855,28 @@ export default function CortexProgrammer() {
               <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500">
                 Firmware
               </div>
-              <button
-                className="w-full rounded-md border border-slate-900 bg-slate-950 px-3 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
-                disabled={busy}
-                onClick={() => {
-                  void pickFirmwareFile();
-                }}
-                type="button"
+              <label
+                className={`block w-full rounded-md border border-slate-900 bg-slate-950 px-3 py-2.5 text-center text-sm font-semibold text-white transition ${
+                  busy
+                    ? "cursor-not-allowed opacity-50"
+                    : "cursor-pointer hover:bg-slate-800"
+                }`}
               >
                 Seleccionar firmware
-              </button>
+                <input
+                  accept=".bin,.elf,application/octet-stream"
+                  className="sr-only"
+                  disabled={busy}
+                  onChange={(event) => {
+                    const input = event.currentTarget;
+                    const file = input.files?.[0] ?? null;
+                    void setSelectedFirmware(file, null).finally(() => {
+                      input.value = "";
+                    });
+                  }}
+                  type="file"
+                />
+              </label>
               <div className="mt-2 min-w-0 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-sm">
                 <div className="truncate font-semibold text-slate-950">
                   {firmwareName || "Ningún archivo seleccionado"}

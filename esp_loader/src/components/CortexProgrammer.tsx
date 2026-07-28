@@ -63,6 +63,8 @@ type WebHidInputReportEvent = Event & {
 type WebHidDevice = EventTarget & {
   opened: boolean;
   productName?: string;
+  manufacturerName?: string;
+  serialNumber?: string;
   vendorId?: number;
   productId?: number;
   open(): Promise<void>;
@@ -199,10 +201,19 @@ function isSamePhysicalProbe(
   first: WebUsbDeviceInfo,
   second: WebUsbDeviceInfo
 ): boolean {
-  return (
-    first.vendorId === second.vendorId &&
-    first.productId === second.productId
-  );
+  if (
+    first.vendorId !== second.vendorId ||
+    first.productId !== second.productId
+  ) {
+    return false;
+  }
+
+  if (first.serialNumber && second.serialNumber) {
+    return first.serialNumber === second.serialNumber;
+  }
+
+  // VID/PID alone cannot distinguish multiple identical probes in a fixture.
+  return first === second;
 }
 
 function createAuthorizedProbe(
@@ -219,7 +230,7 @@ function createAuthorizedProbe(
   return {
     id:
       `${transport}:${formatUsbId(device.vendorId)}:${formatUsbId(device.productId)}:` +
-      `${device.serialNumber ?? index}`,
+      `${device.serialNumber ?? "no-serial"}:${index}`,
     label:
       `${device.productName ?? "CMSIS-DAP"} ` +
       `(${formatUsbId(device.vendorId)}:${formatUsbId(device.productId)}) · ${versionLabel}${serialLabel}`,
@@ -390,6 +401,9 @@ export default function CortexProgrammer() {
   const [progress, setProgress] = useState(0);
   const [showConsole, setShowConsole] = useState(false);
   const [scanningProbes, setScanningProbes] = useState(false);
+  const [authorizingProbe, setAuthorizingProbe] = useState<
+    AuthorizedCmsisProbe["transport"] | null
+  >(null);
   const logsContainerRef = useRef<HTMLDivElement | null>(null);
 
   function addLog(text: string) {
@@ -673,6 +687,86 @@ export default function CortexProgrammer() {
 
   function getHidApi() {
     return (navigator as Navigator & { hid?: WebHidApi }).hid;
+  }
+
+  async function authorizeCmsisDapProbe(
+    transportKind: AuthorizedCmsisProbe["transport"]
+  ) {
+    if (!window.isSecureContext) {
+      addLog(
+        "La autorización CMSIS-DAP requiere HTTPS o localhost. Abre la aplicación desde su URL HTTPS.\n"
+      );
+      return;
+    }
+
+    setAuthorizingProbe(transportKind);
+    try {
+      let selectedDevice: WebUsbDeviceInfo | null = null;
+
+      if (transportKind === "webusb") {
+        const usb = getUsbApi();
+        if (!usb) {
+          throw new Error(
+            "WebUSB no está disponible. Usa Chrome o Edge de escritorio y abre la página directamente."
+          );
+        }
+
+        addLog(
+          "Abriendo selector WebUSB. Elige un CMSIS-DAP v2 conectado.\n"
+        );
+        selectedDevice = (await usb.requestDevice({
+          filters: KNOWN_CMSIS_DAP_IDS,
+        })) as WebUsbDeviceInfo;
+      } else {
+        const hid = getHidApi();
+        if (!hid) {
+          throw new Error(
+            "WebHID no está disponible. Usa Chrome o Edge de escritorio y abre la página directamente."
+          );
+        }
+
+        addLog(
+          "Abriendo selector WebHID. Elige un CMSIS-DAP v1 conectado.\n"
+        );
+        const devices = await hid.requestDevice({ filters: [] });
+        selectedDevice =
+          devices.find((device) => looksLikeCmsisDapDevice(device)) ?? null;
+
+        if (!selectedDevice) {
+          throw new Error(
+            "El dispositivo HID seleccionado no se identificó como CMSIS-DAP."
+          );
+        }
+      }
+
+      const probes = await scanAuthorizedProbes(
+        `Autorización ${transportKind === "webusb" ? "WebUSB v2" : "WebHID v1"} actualizada`
+      );
+      const selectedProbe =
+        probes.find((probe) => probe.device === selectedDevice) ??
+        probes.find(
+          (probe) =>
+            probe.transport === transportKind &&
+            isSamePhysicalProbe(
+              probe.device as WebUsbDeviceInfo,
+              selectedDevice
+            )
+        ) ??
+        null;
+
+      if (selectedProbe) {
+        setSelectedProbeId(selectedProbe.id);
+        setDetectedProbe(selectedProbe.label);
+        setCmsisTransport("auto");
+        addLog(`CMSIS-DAP autorizado: ${selectedProbe.label}\n`);
+      }
+    } catch (err: unknown) {
+      addLog(
+        `No se pudo autorizar ${transportKind === "webusb" ? "WebUSB v2" : "WebHID v1"}: ${getErrorMessage(err)}\n`
+      );
+    } finally {
+      setAuthorizingProbe(null);
+    }
   }
 
   async function resolveConnectedProbe(
@@ -1322,7 +1416,9 @@ export default function CortexProgrammer() {
     logsElement.scrollTop = logsElement.scrollHeight;
   }, [logs, showConsole]);
 
-  const busy = connectingTarget || flashing;
+  const busy = connectingTarget || flashing || authorizingProbe !== null;
+  const webUsbAvailable = Boolean(getUsbApi());
+  const webHidAvailable = Boolean(getHidApi());
   const selectedBatchProbeCount = authorizedProbes.filter((probe) =>
     batchProbeIds.includes(probe.id)
   ).length;
@@ -1550,7 +1646,9 @@ export default function CortexProgrammer() {
                   }
                   type="button"
                 >
-                  {scanningProbes ? "Escaneando..." : "Reescanear"}
+                  {scanningProbes
+                    ? "Escaneando..."
+                    : "Reescanear autorizados"}
                 </button>
               </div>
             </div>
@@ -1563,6 +1661,50 @@ export default function CortexProgrammer() {
                   </span>
                 </summary>
                 <div className="grid gap-2 border-t border-slate-200 p-3">
+              <div className="rounded-md border border-cyan-200 bg-cyan-50 p-3 text-xs text-cyan-950">
+                <div className="font-semibold">
+                  Autoriza los programadores para este sitio
+                </div>
+                <div className="mt-1 text-cyan-800">
+                  Los permisos de localhost no se comparten con GitHub Pages.
+                  Autoriza cada programador una vez; después podrás
+                  reescanearlo automáticamente.
+                </div>
+                <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                  <button
+                    className="rounded-md border border-cyan-600 bg-white px-2.5 py-2 font-semibold text-cyan-900 shadow-sm transition hover:bg-cyan-100 disabled:cursor-not-allowed disabled:opacity-50"
+                    disabled={busy || !webUsbAvailable}
+                    onClick={() => void authorizeCmsisDapProbe("webusb")}
+                    type="button"
+                  >
+                    {authorizingProbe === "webusb"
+                      ? "Esperando selector..."
+                      : "Autorizar v2 / WebUSB"}
+                  </button>
+                  <button
+                    className="rounded-md border border-cyan-600 bg-white px-2.5 py-2 font-semibold text-cyan-900 shadow-sm transition hover:bg-cyan-100 disabled:cursor-not-allowed disabled:opacity-50"
+                    disabled={busy || !webHidAvailable}
+                    onClick={() => void authorizeCmsisDapProbe("webhid")}
+                    type="button"
+                  >
+                    {authorizingProbe === "webhid"
+                      ? "Esperando selector..."
+                      : "Autorizar v1 / WebHID"}
+                  </button>
+                </div>
+                {!webUsbAvailable || !webHidAvailable ? (
+                  <div className="mt-2 font-medium text-amber-800">
+                    Tu navegador no expone{" "}
+                    {!webUsbAvailable && !webHidAvailable
+                      ? "WebUSB ni WebHID"
+                      : !webUsbAvailable
+                        ? "WebUSB"
+                        : "WebHID"}
+                    . Abre la URL HTTPS directamente en Chrome o Edge de
+                    escritorio.
+                  </div>
+                ) : null}
+              </div>
               <div
                 className={
                   detectedProbe
@@ -1577,8 +1719,8 @@ export default function CortexProgrammer() {
                   {detectedProbe
                     ? `Detectado: ${detectedProbe}`
                     : authorizedProbeCount > 1
-                      ? `${authorizedProbeCount} programadores autorizados; pulsa Connect Cortex para elegir`
-                    : "No autorizado todavía; pulsa Connect Cortex"}
+                      ? `${authorizedProbeCount} programadores autorizados; selecciona uno`
+                    : "Ningún CMSIS-DAP autorizado para este sitio"}
                 </div>
               </div>
 

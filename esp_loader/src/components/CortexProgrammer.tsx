@@ -446,6 +446,7 @@ export default function CortexProgrammer() {
   const [familyFilter, setFamilyFilter] = useState<FamilyFilter>("all");
   const [targetSearch, setTargetSearch] = useState("");
   const [swdClockHz, setSwdClockHz] = useState(DEFAULT_SWD_CLOCK_HZ);
+  const [configurationOpen, setConfigurationOpen] = useState(true);
   const [cmsisTransport, setCmsisTransport] =
     useState<CmsisTransportKind>("auto");
   const [detectedProbe, setDetectedProbe] = useState("");
@@ -1687,7 +1688,14 @@ export default function CortexProgrammer() {
   return (
     <main className="min-h-[calc(100vh-65px)] w-full">
       <section className="min-h-[calc(100vh-65px)] overflow-hidden border-y border-slate-800 bg-slate-100">
-        <div className="grid min-w-0 gap-0 xl:grid-cols-[330px_minmax(0,1fr)]">
+        <div
+          className={`grid min-w-0 gap-0 ${
+            configurationOpen
+              ? "xl:grid-cols-[330px_minmax(0,1fr)]"
+              : "grid-cols-1"
+          }`}
+        >
+          {configurationOpen ? (
           <div className="grid min-w-0 content-start gap-2">
             <div className="border-b border-r border-slate-300 bg-white p-3">
               <div className="mb-2 flex items-center justify-between">
@@ -1855,12 +1863,41 @@ export default function CortexProgrammer() {
                 />
               </div>
             </div>
+            <button
+              className="mx-2 mb-2 rounded border border-cyan-600 bg-cyan-50 px-2 py-1.5 text-xs font-bold text-cyan-900 hover:bg-cyan-100"
+              disabled={busy}
+              onClick={() => setConfigurationOpen(false)}
+              type="button"
+            >
+              Listo · ocultar configuración
+            </button>
           </div>
+          ) : null}
 
           <aside className="min-w-0 bg-slate-100 p-2 lg:p-3">
             <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-              <div className="text-sm font-bold text-slate-950">
-                10 sockets
+              <div className="flex min-w-0 items-center gap-2">
+                <button
+                  className="shrink-0 rounded border border-slate-300 bg-white px-2 py-1 text-xs font-bold text-slate-700 hover:border-cyan-500 hover:text-cyan-800 disabled:opacity-50"
+                  disabled={busy}
+                  onClick={() =>
+                    setConfigurationOpen((current) => !current)
+                  }
+                  type="button"
+                >
+                  {configurationOpen ? "Ocultar configuración" : "Configurar"}
+                </button>
+                <div className="min-w-0 truncate text-[11px] text-slate-600">
+                  <strong className="text-slate-900">
+                    {selectedTargetConfig.label}
+                  </strong>
+                  {" · "}
+                  {formatSwdClock(swdClockHz)}
+                  {" · "}
+                  {firmwareName || "sin firmware"}
+                  {" · "}
+                  <span className="font-mono font-bold">{progress}%</span>
+                </div>
               </div>
               <div className="flex items-center gap-2">
                 <div className="rounded-full border border-slate-200 bg-white px-2 py-1 font-mono text-[10px] font-bold text-slate-700">
@@ -2037,12 +2074,18 @@ export default function CortexProgrammer() {
                     {authorizedProbes.length} conectados
                   </div>
                 </div>
-                <div className="grid min-w-0 gap-1.5 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
+                <div
+                  className={`grid min-w-0 gap-2 sm:grid-cols-2 ${
+                    configurationOpen
+                      ? "lg:grid-cols-3 2xl:grid-cols-5"
+                      : "md:grid-cols-3 xl:grid-cols-5"
+                  }`}
+                >
                   {panelSlots.map((probe, slotIndex) => {
                     if (!probe) {
                       return (
                         <div
-                          className="grid min-h-20 content-between gap-1.5 rounded border border-dashed border-slate-300 bg-slate-100/60 p-2"
+                          className="grid min-h-24 content-between gap-2 rounded-md border border-dashed border-slate-300 bg-slate-100/60 p-2.5"
                           key={`empty-slot-${slotIndex}`}
                         >
                           <div className="flex items-center gap-2">
@@ -2053,40 +2096,41 @@ export default function CortexProgrammer() {
                               Socket vacío
                             </div>
                           </div>
-                          <div className="grid grid-cols-2 gap-1.5">
-                            <button
-                              className="rounded border border-cyan-500 bg-white px-2 py-1.5 text-[11px] font-bold text-cyan-900 hover:bg-cyan-50 disabled:opacity-50"
-                              disabled={busy || !webUsbAvailable}
-                              onClick={() =>
+                          <select
+                            className="w-full rounded border border-cyan-500 bg-white px-2 py-1.5 text-xs font-bold text-cyan-900 disabled:opacity-50"
+                            defaultValue=""
+                            disabled={busy}
+                            onChange={(event) => {
+                              const transport = event.currentTarget.value as
+                                | AuthorizedCmsisProbe["transport"]
+                                | "";
+                              event.currentTarget.value = "";
+                              if (transport) {
                                 void authorizeCmsisDapProbe(
-                                  "webusb",
+                                  transport,
                                   slotIndex
-                                )
+                                );
                               }
-                              type="button"
+                            }}
+                          >
+                            <option value="">
+                              {authorizingSlot === slotIndex
+                                ? "Esperando selector..."
+                                : "Conectar programador..."}
+                            </option>
+                            <option
+                              disabled={!webUsbAvailable}
+                              value="webusb"
                             >
-                              {authorizingSlot === slotIndex &&
-                              authorizingProbe === "webusb"
-                                ? "..."
-                                : "v2 / USB"}
-                            </button>
-                            <button
-                              className="rounded border border-cyan-500 bg-white px-2 py-1.5 text-[11px] font-bold text-cyan-900 hover:bg-cyan-50 disabled:opacity-50"
-                              disabled={busy || !webHidAvailable}
-                              onClick={() =>
-                                void authorizeCmsisDapProbe(
-                                  "webhid",
-                                  slotIndex
-                                )
-                              }
-                              type="button"
+                              v2 / WebUSB
+                            </option>
+                            <option
+                              disabled={!webHidAvailable}
+                              value="webhid"
                             >
-                              {authorizingSlot === slotIndex &&
-                              authorizingProbe === "webhid"
-                                ? "..."
-                                : "v1 / HID"}
-                            </button>
-                          </div>
+                              v1 / WebHID
+                            </option>
+                          </select>
                         </div>
                       );
                     }
@@ -2103,7 +2147,7 @@ export default function CortexProgrammer() {
 
                         return (
                           <div
-                            className={`relative grid min-h-20 min-w-0 content-between gap-1.5 rounded border p-2 text-xs shadow-sm transition ${statusClassName}`}
+                            className={`relative grid min-h-24 min-w-0 content-between gap-2 rounded-md border p-2.5 text-xs shadow-sm transition ${statusClassName}`}
                             key={probe.id}
                           >
                             <span className="absolute right-2 top-2 grid size-6 place-items-center rounded-full border border-current/15 bg-white/70 font-mono text-[10px] font-bold opacity-70">
@@ -2126,7 +2170,7 @@ export default function CortexProgrammer() {
                                 type="checkbox"
                               />
                               <span className="min-w-0">
-                                <span className="block break-words pr-7 text-xs font-bold leading-snug">
+                                <span className="block break-words pr-7 text-sm font-bold leading-snug">
                                   {probe.label.split(" · ")[0]}
                                 </span>
                                 <span className="mt-1 block break-words font-mono text-[10px] font-medium opacity-75">
@@ -2161,35 +2205,41 @@ export default function CortexProgrammer() {
                                 </span>
                               </>
                             ) : null}
-                            <div className="flex justify-end gap-1">
-                              <button
-                                className="rounded border border-current/20 bg-white/70 px-1.5 py-1 text-[10px] font-bold hover:bg-white disabled:opacity-50"
-                                disabled={busy || !webUsbAvailable}
-                                onClick={() =>
-                                  void authorizeCmsisDapProbe(
-                                    "webusb",
-                                    slotIndex
-                                  )
-                                }
-                                type="button"
+                            <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-1.5">
+                              <select
+                                className="min-w-0 rounded border border-current/20 bg-white/70 px-1.5 py-1 text-[10px] font-bold hover:bg-white disabled:opacity-50"
+                                defaultValue=""
+                                disabled={busy}
+                                onChange={(event) => {
+                                  const transport = event.currentTarget
+                                    .value as
+                                    | AuthorizedCmsisProbe["transport"]
+                                    | "";
+                                  event.currentTarget.value = "";
+                                  if (transport) {
+                                    void authorizeCmsisDapProbe(
+                                      transport,
+                                      slotIndex
+                                    );
+                                  }
+                                }}
                               >
-                                Cambiar v2
-                              </button>
+                                <option value="">Cambiar programador...</option>
+                                <option
+                                  disabled={!webUsbAvailable}
+                                  value="webusb"
+                                >
+                                  v2 / WebUSB
+                                </option>
+                                <option
+                                  disabled={!webHidAvailable}
+                                  value="webhid"
+                                >
+                                  v1 / WebHID
+                                </option>
+                              </select>
                               <button
-                                className="rounded border border-current/20 bg-white/70 px-1.5 py-1 text-[10px] font-bold hover:bg-white disabled:opacity-50"
-                                disabled={busy || !webHidAvailable}
-                                onClick={() =>
-                                  void authorizeCmsisDapProbe(
-                                    "webhid",
-                                    slotIndex
-                                  )
-                                }
-                                type="button"
-                              >
-                                Cambiar v1
-                              </button>
-                              <button
-                                className="rounded border border-current/20 bg-white/70 px-1.5 py-1 text-[10px] font-bold hover:bg-white disabled:opacity-50"
+                                className="rounded border border-current/20 bg-white/70 px-2 py-1 text-[10px] font-bold hover:bg-white disabled:opacity-50"
                                 disabled={busy}
                                 onClick={() => {
                                   setPanelSlotProbeIds((current) =>
@@ -2241,53 +2291,56 @@ export default function CortexProgrammer() {
                 </div>
               </div>
 
-              <div className="grid grid-cols-2 gap-1.5 lg:grid-cols-4">
-                <button
-                  className={`${buttonBase} border-cyan-600 bg-white text-cyan-900 shadow-sm hover:bg-cyan-50`}
-                  disabled={
-                    busy ||
-                    !selectedTargetAvailable ||
-                    selectedBatchProbeCount === 0
-                  }
-                  onClick={testSelectedCortexTargets}
-                  type="button"
-                >
-                  {connectingTarget
-                    ? "Probando..."
-                    : `Probar ${selectedBatchProbeCount}`}
-                </button>
-                <button
-                  className={`${buttonBase} border-cyan-500 bg-cyan-400 text-slate-950 shadow-sm hover:bg-cyan-300`}
-                  disabled={
-                    busy ||
-                    !firmware ||
-                    !selectedTargetAvailable ||
-                    selectedBatchProbeCount === 0
-                  }
-                  onClick={flashCortexFirmwareBatch}
-                  type="button"
-                >
-                  {flashing
-                    ? "Ciclo..."
-                    : `Programar ${selectedBatchProbeCount}`}
-                </button>
-                <button
-                  className={`${buttonBase} border-slate-300 bg-white text-slate-700 hover:border-cyan-400 hover:text-cyan-800`}
-                  disabled={busy || !selectedTargetAvailable}
-                  onClick={connectCortexTarget}
-                  type="button"
-                >
-                  {connectingTarget ? "Conectando..." : "Probar uno"}
-                </button>
-
-                <button
-                  className={`${buttonBase} border-slate-700 bg-slate-800 text-white hover:bg-slate-700`}
-                  disabled={busy || !firmware || !selectedTargetAvailable}
-                  onClick={flashCortexFirmware}
-                  type="button"
-                >
-                  {flashing ? "Programando..." : "Programar uno"}
-                </button>
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-slate-200 bg-white p-2">
+                <div className="flex gap-1.5">
+                  <button
+                    className={`${buttonBase} border-slate-300 bg-white text-slate-600 hover:border-cyan-400 hover:text-cyan-800`}
+                    disabled={busy || !selectedTargetAvailable}
+                    onClick={connectCortexTarget}
+                    type="button"
+                  >
+                    {connectingTarget ? "Conectando..." : "Probar uno"}
+                  </button>
+                  <button
+                    className={`${buttonBase} border-slate-300 bg-white text-slate-600 hover:border-slate-500 hover:text-slate-900`}
+                    disabled={busy || !firmware || !selectedTargetAvailable}
+                    onClick={flashCortexFirmware}
+                    type="button"
+                  >
+                    {flashing ? "Programando..." : "Programar uno"}
+                  </button>
+                </div>
+                <div className="flex flex-1 justify-end gap-1.5 sm:flex-none">
+                  <button
+                    className={`${buttonBase} border-cyan-600 bg-cyan-50 px-3 text-cyan-900 shadow-sm hover:bg-cyan-100`}
+                    disabled={
+                      busy ||
+                      !selectedTargetAvailable ||
+                      selectedBatchProbeCount === 0
+                    }
+                    onClick={testSelectedCortexTargets}
+                    type="button"
+                  >
+                    {connectingTarget
+                      ? "Probando lote..."
+                      : `Probar lote · ${selectedBatchProbeCount}`}
+                  </button>
+                  <button
+                    className={`${buttonBase} border-cyan-500 bg-cyan-400 px-4 text-sm font-bold text-slate-950 shadow-sm hover:bg-cyan-300`}
+                    disabled={
+                      busy ||
+                      !firmware ||
+                      !selectedTargetAvailable ||
+                      selectedBatchProbeCount === 0
+                    }
+                    onClick={flashCortexFirmwareBatch}
+                    type="button"
+                  >
+                    {flashing
+                      ? "Programando lote..."
+                      : `Programar lote · ${selectedBatchProbeCount}`}
+                  </button>
+                </div>
               </div>
             </div>
           </aside>

@@ -5,9 +5,21 @@ import ESPFlasher from "./components/ESPFlasher";
 type AppSection = "cortex" | "esp32";
 
 const sections = [
-  { id: "cortex", label: "Cortex" },
-  { id: "esp32", label: "ESP32" },
-] as const satisfies ReadonlyArray<{ id: AppSection; label: string }>;
+  {
+    id: "cortex",
+    label: "Cortex",
+    activeClassName: "bg-cyan-400 text-slate-950 shadow-sm",
+  },
+  {
+    id: "esp32",
+    label: "ESP32",
+    activeClassName: "bg-orange-500 text-white shadow-sm",
+  },
+] as const satisfies ReadonlyArray<{
+  id: AppSection;
+  label: string;
+  activeClassName: string;
+}>;
 
 function App() {
   const [activeSection, setActiveSection] = useState<AppSection>("cortex");
@@ -38,9 +50,10 @@ function App() {
               <button
                 className={`rounded px-3 py-2 text-sm font-semibold transition ${
                   activeSection === section.id
-                    ? "bg-cyan-400 text-slate-950 shadow-sm"
+                    ? section.activeClassName
                     : "text-slate-300 hover:bg-slate-800 hover:text-white"
                 }`}
+                aria-current={activeSection === section.id ? "page" : undefined}
                 key={section.id}
                 onClick={() => setActiveSection(section.id)}
                 type="button"

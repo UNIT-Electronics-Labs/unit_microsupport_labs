@@ -20,7 +20,9 @@ const FAMILY_LABELS: Record<(typeof FIRMWARE_FAMILIES)[number], string> = {
 };
 
 const UPLOAD_BAUD_RATES = [115200, 230400, 460800, 921600] as const;
-const DEFAULT_UPLOAD_BAUD_RATE = 460800;
+// A blank ESP has to be reached through its ROM bootloader. Start with the
+// most reliable speed; production can raise it after the fixture is proven.
+const DEFAULT_UPLOAD_BAUD_RATE = 115200;
 const MAX_ESP_SLOTS = 10;
 const espPortInstanceIds = new WeakMap<object, number>();
 let nextEspPortInstanceId = 1;
@@ -33,7 +35,7 @@ type EspPortSlot = {
   port: any;
 };
 type EspSlotFlashStatus = {
-  state: "waiting" | "programming" | "success" | "error";
+  state: "waiting" | "programming" | "success" | "no_flash" | "error";
   progress: number;
   message?: string;
 };
@@ -70,6 +72,25 @@ function detectFamily(fileName: string): FirmwareFamily {
 function isMicroPythonFirmware(fileName: string): boolean {
   const name = fileName.toLowerCase();
   return name.includes("micropython") || name.includes("micro_python");
+}
+
+function getEspFlashErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+
+  if (message.toLowerCase().includes("failed to connect with the device")) {
+    return "Sin respuesta del bootloader. Mantén BOOT, pulsa RESET y programa a 115200 baud.";
+  }
+
+  return message;
+}
+
+async function isFlashDetected(esploader: ESPLoader): Promise<boolean> {
+  try {
+    const flashId = await esploader.readFlashId();
+    return flashId !== 0x000000 && flashId !== 0xffffff;
+  } catch {
+    return false;
+  }
 }
 
 function getEspPortSlot(port: any): EspPortSlot {
@@ -118,6 +139,10 @@ export default function ESPFlasher() {
 
   const [port, setPort] = useState<any>(null);
 
+  // Keep the current handles outside React state so that the cleanup on
+  // unmount/page reload never uses a stale `port` value.
+  const portRef = useRef<any>(null);
+
   const [firmware, setFirmware] = useState<File | null>(null);
 
   const [firmwareName, setFirmwareName] = useState("");
@@ -154,6 +179,8 @@ export default function ESPFlasher() {
     () => Array.from({ length: MAX_ESP_SLOTS }, () => null)
   );
 
+  const espPortSlotsRef = useRef<Array<EspPortSlot | null>>([]);
+
   const [activeEspSlotIndex, setActiveEspSlotIndex] = useState<number | null>(
     null
   );
@@ -172,6 +199,11 @@ export default function ESPFlasher() {
     return (navigator as Navigator & { serial?: any }).serial;
   }
 
+  function setActivePort(nextPort: any) {
+    portRef.current = nextPort;
+    setPort(nextPort);
+  }
+
   async function stopReading() {
     if (!readerRef.current) return;
 
@@ -188,6 +220,27 @@ export default function ESPFlasher() {
     }
 
     readerRef.current = null;
+  }
+
+  async function releaseEspPorts() {
+    await stopReading();
+
+    const ports = [
+      portRef.current,
+      ...espPortSlotsRef.current.map((slot) => slot?.port),
+    ].filter((candidate, index, all) => candidate && all.indexOf(candidate) === index);
+
+    await Promise.all(
+      ports.map(async (serialPort) => {
+        try {
+          await serialPort.close();
+        } catch {
+          // A port may already have been closed by esptool or the browser.
+        }
+      })
+    );
+
+    portRef.current = null;
   }
 
   async function openPortSafely(selectedPort: any, baudRate = 115200) {
@@ -235,7 +288,7 @@ export default function ESPFlasher() {
 
     if (port === lostPort) {
       setConnected(false);
-      setPort(null);
+      setActivePort(null);
       setActiveEspSlotIndex(null);
     }
 
@@ -431,7 +484,7 @@ export default function ESPFlasher() {
 
       await openPortSafely(selectedPort, 115200);
 
-      setPort(selectedPort);
+      setActivePort(selectedPort);
 
       setConnected(true);
 
@@ -486,7 +539,7 @@ export default function ESPFlasher() {
       if (port !== slot.port) {
         await stopReading();
         await openPortSafely(slot.port, 115200);
-        setPort(slot.port);
+        setActivePort(slot.port);
         void startReading(slot.port);
       }
 
@@ -594,7 +647,7 @@ export default function ESPFlasher() {
 
       setConnected(false);
 
-      setPort(null);
+      setActivePort(null);
 
       addLog("\nESP disconnected\n");
 
@@ -724,7 +777,7 @@ export default function ESPFlasher() {
       await esploader.transport.disconnect();
 
       setConnected(false);
-      setPort(null);
+      setActivePort(null);
 
       addLog("ESP released\n");
 
@@ -787,7 +840,11 @@ export default function ESPFlasher() {
         Object.fromEntries(
           selectedSlots.map((slot) => [
             slot.id,
-            { state: "waiting", progress: 0 },
+            {
+              state: "waiting",
+              progress: 0,
+              message: "En espera para programar...",
+            },
           ])
         )
       );
@@ -806,7 +863,11 @@ export default function ESPFlasher() {
           try {
             setEspFlashStatuses((current) => ({
               ...current,
-              [slot.id]: { state: "programming", progress: 0 },
+              [slot.id]: {
+                state: "programming",
+                progress: 0,
+                message: "Preparando programación...",
+              },
             }));
             addLog(`[${slot.label}] Inicializando esptool...\n`);
 
@@ -871,6 +932,7 @@ export default function ESPFlasher() {
             }));
             addLog(`[${slot.label}] Firmware programado correctamente.\n`);
           } catch (err: any) {
+            const errorMessage = getEspFlashErrorMessage(err);
             if (isDeviceLostError(err)) {
               forgetLostPort(slot.port, "El puerto se perdió durante la programación");
             }
@@ -879,10 +941,10 @@ export default function ESPFlasher() {
               [slot.id]: {
                 state: "error",
                 progress: progressByPort.get(slot.id) ?? 0,
-                message: err.message,
+                message: errorMessage,
               },
             }));
-            addLog(`[${slot.label}] Error: ${err.message}\n`);
+            addLog(`[${slot.label}] Error: ${errorMessage}\n`);
             try {
               await transport?.disconnect();
             } catch {
@@ -894,7 +956,7 @@ export default function ESPFlasher() {
 
       if (port && selectedSlots.some((slot) => slot.port === port)) {
         setConnected(false);
-        setPort(null);
+        setActivePort(null);
       }
     } catch (err: any) {
       console.error(err);
@@ -922,7 +984,11 @@ export default function ESPFlasher() {
         Object.fromEntries(
           selectedSlots.map((slot) => [
             slot.id,
-            { state: "waiting", progress: 0 },
+            {
+              state: "waiting",
+              progress: 0,
+              message: "En espera para borrar...",
+            },
           ])
         )
       );
@@ -941,7 +1007,11 @@ export default function ESPFlasher() {
           try {
             setEspFlashStatuses((current) => ({
               ...current,
-              [slot.id]: { state: "programming", progress: 0 },
+              [slot.id]: {
+                state: "programming",
+                progress: 0,
+                message: "Borrando memoria... esperando respuesta.",
+              },
             }));
             addLog(`[${slot.label}] Inicializando borrado...\n`);
 
@@ -967,19 +1037,29 @@ export default function ESPFlasher() {
             });
 
             await esploader.main("default_reset");
+            const flashDetected = await isFlashDetected(esploader);
             await esploader.eraseFlash();
             await transport.disconnect();
             transport = null;
             setEspFlashStatuses((current) => ({
               ...current,
               [slot.id]: {
-                state: "success",
+                state: flashDetected ? "success" : "no_flash",
                 progress: 100,
-                message: "Borrado",
+                message: flashDetected
+                  ? "Borrado"
+                  : "Borrado enviado. La flash no respondió a la verificación.",
               },
             }));
-            addLog(`[${slot.label}] Flash borrada correctamente.\n`);
+            addLog(
+              `[${slot.label}] ${
+                flashDetected
+                  ? "Flash borrada correctamente."
+                  : "Comando de borrado enviado; flash no verificada."
+              }\n`
+            );
           } catch (err: any) {
+            const errorMessage = getEspFlashErrorMessage(err);
             if (isDeviceLostError(err)) {
               forgetLostPort(slot.port, "El puerto se perdió durante el borrado");
             }
@@ -988,10 +1068,10 @@ export default function ESPFlasher() {
               [slot.id]: {
                 state: "error",
                 progress: 0,
-                message: err.message,
+                message: errorMessage,
               },
             }));
-            addLog(`[${slot.label}] Error: ${err.message}\n`);
+            addLog(`[${slot.label}] Error: ${errorMessage}\n`);
             try {
               await transport?.disconnect();
             } catch {
@@ -1003,7 +1083,7 @@ export default function ESPFlasher() {
 
       if (port && selectedSlots.some((slot) => slot.port === port)) {
         setConnected(false);
-        setPort(null);
+        setActivePort(null);
       }
     } catch (err: any) {
       console.error(err);
@@ -1144,20 +1224,25 @@ export default function ESPFlasher() {
       });
 
       await esploader.main("default_reset");
+      const flashDetected = await isFlashDetected(esploader);
 
       addLog("ESP detected successfully\n");
       addLog("Starting full erase...\n");
 
       await esploader.eraseFlash();
 
-      addLog("\nFlash erased successfully\n");
+      addLog(
+        flashDetected
+          ? "\nFlash erased successfully\n"
+          : "\nErase command sent; flash could not be verified.\n"
+      );
 
       setProgress(100);
 
       await esploader.transport.disconnect();
 
       setConnected(false);
-      setPort(null);
+      setActivePort(null);
 
       addLog("ESP released\n");
 
@@ -1231,9 +1316,26 @@ export default function ESPFlasher() {
     void loadFirmwareManifest();
 
     return () => {
-      disconnectESP();
+      void releaseEspPorts();
     };
 
+  }, []);
+
+  useEffect(() => {
+    portRef.current = port;
+  }, [port]);
+
+  useEffect(() => {
+    espPortSlotsRef.current = espPortSlots;
+  }, [espPortSlots]);
+
+  useEffect(() => {
+    const releaseOnPageExit = () => {
+      void releaseEspPorts();
+    };
+
+    window.addEventListener("pagehide", releaseOnPageExit);
+    return () => window.removeEventListener("pagehide", releaseOnPageExit);
   }, []);
 
   useEffect(() => {
@@ -1277,6 +1379,9 @@ export default function ESPFlasher() {
   ).length;
   const failedEspCount = Object.values(espFlashStatuses).filter(
     (status) => status.state === "error"
+  ).length;
+  const noFlashEspCount = Object.values(espFlashStatuses).filter(
+    (status) => status.state === "no_flash"
   ).length;
 
   function selectFamily(family: FirmwareFamily) {
@@ -1375,17 +1480,17 @@ export default function ESPFlasher() {
                     }
 
                     return (
-                      <div className={`relative grid min-h-28 min-w-0 content-between gap-2 rounded-md border p-2.5 text-xs shadow-sm ${status?.state === "success" ? "border-emerald-200 bg-emerald-50 text-emerald-800" : status?.state === "error" ? "border-red-200 bg-red-50 text-red-800" : status?.state === "programming" ? "border-amber-200 bg-amber-50 text-amber-800" : isActive ? "border-emerald-200 bg-emerald-50 text-emerald-800" : "border-slate-200 bg-white text-slate-700"}`} key={slot.id}>
+                      <div className={`relative grid min-h-28 min-w-0 content-between gap-2 rounded-md border p-2.5 text-xs shadow-sm ${status?.state === "success" ? "border-emerald-200 bg-emerald-50 text-emerald-800" : status?.state === "no_flash" ? "border-sky-200 bg-sky-50 text-sky-800" : status?.state === "programming" || status?.state === "waiting" ? "border-cyan-200 bg-cyan-50 text-cyan-800" : status?.state === "error" ? "border-red-200 bg-red-50 text-red-800" : isActive ? "border-emerald-200 bg-emerald-50 text-emerald-800" : "border-slate-200 bg-white text-slate-700"}`} key={slot.id}>
                         <span className="absolute right-2 top-2 grid size-6 place-items-center rounded-full border border-current/15 bg-white/70 font-mono text-[10px] font-bold opacity-70">{slotIndex + 1}</span>
-                        <label className="flex min-w-0 cursor-pointer items-start gap-2 pr-7"><input checked={selectedEspPortIds.includes(slot.id)} className="mt-0.5 shrink-0" disabled={busy} onChange={(event) => setSelectedEspPortIds((current) => event.target.checked ? [...current, slot.id] : current.filter((portId) => portId !== slot.id))} type="checkbox" /><span className="min-w-0"><span className="block truncate text-sm font-bold">ESP asignado</span><span className="mt-1 block truncate font-mono text-[10px] opacity-75">{slot.label}</span><span className="mt-1 block text-[10px] font-bold">{status?.state === "success" ? "PROGRAMADO" : status?.state === "error" ? "ERROR" : status?.state === "programming" ? `${status.progress.toFixed(0)}%` : isActive ? "ACTIVO" : "Disponible"}</span></span></label>
-                        {status ? <div className="h-1.5 overflow-hidden rounded-full bg-white/80"><div className={`h-full rounded-full ${status.state === "error" ? "bg-red-500" : status.state === "success" ? "bg-emerald-500" : "bg-cyan-500"}`} style={{ width: `${status.progress}%` }} /></div> : null}
+                        <label className="flex min-w-0 cursor-pointer items-start gap-2 pr-7"><input checked={selectedEspPortIds.includes(slot.id)} className="mt-0.5 shrink-0" disabled={busy} onChange={(event) => setSelectedEspPortIds((current) => event.target.checked ? [...current, slot.id] : current.filter((portId) => portId !== slot.id))} type="checkbox" /><span className="min-w-0"><span className="block truncate text-sm font-bold">ESP asignado</span><span className="mt-1 block truncate font-mono text-[10px] opacity-75">{slot.label}</span><span className={`mt-1 block text-[10px] font-bold ${status?.state === "programming" || status?.state === "waiting" ? "animate-pulse" : ""}`}>{status?.state === "success" ? "PROGRAMADO" : status?.state === "no_flash" ? "FLASH NO VERIFICADA" : status?.state === "error" ? "ERROR" : status?.state === "programming" ? "EN PROCESO..." : status?.state === "waiting" ? "EN ESPERA..." : isActive ? "ACTIVO" : "Disponible"}</span>{(status?.state === "error" || status?.state === "no_flash" || status?.state === "programming" || status?.state === "waiting") && status.message ? <span className="mt-1 block text-[10px] leading-tight" title={status.message}>{status.message}</span> : null}</span></label>
+                        {status ? <div className="h-1.5 overflow-hidden rounded-full bg-white/80"><div className={`h-full rounded-full ${status.state === "error" ? "bg-red-500" : status.state === "success" ? "bg-emerald-500" : status.state === "no_flash" ? "bg-sky-500" : "bg-cyan-500"}`} style={{ width: `${status.progress}%` }} /></div> : null}
                         <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-1.5"><button className="rounded border border-current/20 bg-white/70 px-1.5 py-1 text-[10px] font-bold hover:bg-white disabled:opacity-50" disabled={busy || isActive} onClick={() => void selectEspPortSlot(slotIndex)} type="button">{isActive ? "Estación activa" : "Seleccionar"}</button><button className="rounded border border-current/20 bg-white/70 px-2 py-1 text-[10px] font-bold hover:bg-white disabled:opacity-50" disabled={busy} onClick={() => void removeEspPortSlot(slotIndex)} type="button">Quitar</button></div>
                       </div>
                     );
                   })}
                 </div>
                 <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded border border-slate-200 bg-white p-2">
-                  <div className="flex items-center gap-3 text-[10px] font-bold uppercase tracking-wide text-slate-500"><span><strong className="font-mono text-emerald-600">{successfulEspCount}</strong> OK</span><span><strong className="font-mono text-red-600">{failedEspCount}</strong> Error</span></div>
+                  <div className="flex items-center gap-3 text-[10px] font-bold uppercase tracking-wide text-slate-500"><span><strong className="font-mono text-emerald-600">{successfulEspCount}</strong> OK</span><span><strong className="font-mono text-sky-600">{noFlashEspCount}</strong> Sin flash</span><span><strong className="font-mono text-red-600">{failedEspCount}</strong> Error</span></div>
                   <div className="flex flex-wrap gap-1.5"><button className={`${buttonBase} border-slate-300 bg-white px-3 text-slate-700 hover:border-slate-500 hover:text-slate-900`} disabled={busy || selectedEspSlotCount === 0} onClick={() => void resetSelectedESPs()} type="button">{flashing ? "Procesando lote..." : `Reset seleccionados · ${selectedEspSlotCount}`}</button><button className={`${buttonBase} border-amber-500 bg-amber-50 px-3 text-amber-900 hover:bg-amber-100`} disabled={busy || selectedEspSlotCount === 0} onClick={() => void eraseSelectedESPs()} type="button">{flashing ? "Procesando lote..." : `Borrar seleccionados · ${selectedEspSlotCount}`}</button><button className={`${buttonBase} border-cyan-500 bg-cyan-400 px-4 text-sm font-bold text-slate-950 shadow-sm hover:bg-cyan-300`} disabled={busy || !firmware || selectedEspSlotCount === 0} onClick={() => void flashSelectedESPs()} type="button">{flashing ? "Programando lote..." : `Programar seleccionados · ${selectedEspSlotCount}`}</button></div>
                 </div>
               </fieldset>

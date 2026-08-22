@@ -1,14 +1,20 @@
 import { useState } from "react";
 import CortexProgrammer from "./components/CortexProgrammer";
 import ESPFlasher from "./components/ESPFlasher";
+import Rp2Programmer from "./components/Rp2Programmer";
 
-type AppSection = "cortex" | "esp32";
+type AppSection = "cortex" | "rp2" | "esp32";
 
 const sections = [
   {
     id: "cortex",
     label: "Cortex",
     activeClassName: "bg-cyan-400 text-slate-950 shadow-sm",
+  },
+  {
+    id: "rp2",
+    label: "RP2",
+    activeClassName: "bg-indigo-400 text-slate-950 shadow-sm",
   },
   {
     id: "esp32",
@@ -44,7 +50,7 @@ function App() {
 
           <nav
             aria-label="Secciones principales"
-            className="grid w-full grid-cols-2 rounded-md border border-slate-700 bg-slate-900 p-1 sm:w-auto sm:min-w-[320px]"
+            className="grid w-full grid-cols-3 rounded-md border border-slate-700 bg-slate-900 p-1 sm:w-auto sm:min-w-[420px]"
           >
             {sections.map((section) => (
               <button
@@ -65,7 +71,7 @@ function App() {
         </div>
       </header>
 
-      {activeSection === "cortex" ? <CortexProgrammer /> : <ESPFlasher />}
+      {activeSection === "cortex" ? <CortexProgrammer /> : activeSection === "rp2" ? <Rp2Programmer /> : <ESPFlasher />}
     </div>
   );
 }

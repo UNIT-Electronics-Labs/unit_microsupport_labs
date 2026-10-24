@@ -5,19 +5,20 @@ import {
   type Transport as DapTransport,
   WebUSB as DapWebUSB,
 } from "dapjs";
-import { flashPy32F0, PY32_DAP_WAIT_RETRY, PY32_DBGMCU_IDCODE_ADDRESS } from "../cortex/flash/py32f0";
-import { flashStm32F1, STM32_DBGMCU_IDCODE_ADDRESS } from "../cortex/flash/stm32f1";
+import { flashPy32F0, PY32_DAP_WAIT_RETRY } from "../cortex/flash/py32f0";
+import { flashStm32F1 } from "../cortex/flash/stm32f1";
 import { parseFirmwareImage } from "../cortex/firmware";
 import { TARGETS, type TargetKey } from "../cortex/targets";
 import {
+  formatCortexValidation,
+  validateCortexTarget,
+} from "../cortex/validation";
+import {
   formatBytes,
   formatHex32,
-  getDebugDeviceId,
-  getDebugRevisionId,
   getErrorMessage,
 } from "../cortex/utils";
 
-const CORTEX_CPUID_ADDRESS = 0xe000ed00;
 const DEFAULT_SWD_CLOCK_HZ = 1_000_000;
 const MAX_PANEL_SLOTS = 10;
 const probeInstanceIds = new WeakMap<object, number>();
@@ -25,6 +26,10 @@ let nextProbeInstanceId = 1;
 
 type FamilyFilter = "all" | "stm32" | "py32" | "gd32";
 type CmsisTransportKind = "auto" | "webhid" | "webusb";
+type CortexProgrammerProps = {
+  initialFamily?: Exclude<FamilyFilter, "all">;
+  initialTransport?: CmsisTransportKind;
+};
 type WebUsbDeviceInfo = {
   vendorId?: number;
   productId?: number;
@@ -441,14 +446,23 @@ function createCortexTarget(
   };
 }
 
-export default function CortexProgrammer() {
-  const [selectedTarget, setSelectedTarget] = useState<TargetKey>("stm32f103rc");
-  const [familyFilter, setFamilyFilter] = useState<FamilyFilter>("all");
+export default function CortexProgrammer({
+  initialFamily = "stm32",
+  initialTransport = "auto",
+}: CortexProgrammerProps) {
+  const initialTarget = (
+    Object.entries(TARGETS) as Array<
+      [TargetKey, (typeof TARGETS)[TargetKey]]
+    >
+  ).find(([, target]) => target.family === initialFamily)?.[0] ?? "stm32f103rc";
+  const [selectedTarget, setSelectedTarget] = useState<TargetKey>(initialTarget);
+  const [familyFilter, setFamilyFilter] =
+    useState<FamilyFilter>(initialFamily);
   const [targetSearch, setTargetSearch] = useState("");
   const [swdClockHz, setSwdClockHz] = useState(DEFAULT_SWD_CLOCK_HZ);
   const [configurationOpen, setConfigurationOpen] = useState(true);
   const [cmsisTransport, setCmsisTransport] =
-    useState<CmsisTransportKind>("auto");
+    useState<CmsisTransportKind>(initialTransport);
   const [detectedProbe, setDetectedProbe] = useState("");
   const [authorizedProbeCount, setAuthorizedProbeCount] = useState(0);
   const [authorizedProbes, setAuthorizedProbes] = useState<
@@ -1162,32 +1176,8 @@ export default function CortexProgrammer() {
       await target.halt();
       addLog("Core halted\n");
 
-      const cpuid = await target.readMem32(CORTEX_CPUID_ADDRESS);
-      addLog(`CPUID: ${formatHex32(cpuid)}\n`);
-
-      try {
-        const debugId = await target.readMem32(STM32_DBGMCU_IDCODE_ADDRESS);
-        addLog(
-          `DBGMCU_IDCODE: ${formatHex32(debugId)} ` +
-            `(dev ${formatHex32(getDebugDeviceId(debugId))}, ` +
-            `rev 0x${getDebugRevisionId(debugId).toString(16).padStart(4, "0")})\n`
-        );
-      } catch {
-        addLog("DBGMCU_IDCODE: unavailable\n");
-      }
-
-      if (targetConfig.algorithm === "py32f0") {
-        try {
-          const py32DebugId = await target.readMem32(PY32_DBGMCU_IDCODE_ADDRESS);
-          addLog(
-            `PY32 DBGMCU_IDCODE: ${formatHex32(py32DebugId)} ` +
-              `(dev ${formatHex32(getDebugDeviceId(py32DebugId))}, ` +
-              `rev 0x${getDebugRevisionId(py32DebugId).toString(16).padStart(4, "0")})\n`
-          );
-        } catch {
-          addLog("PY32 DBGMCU_IDCODE: unavailable\n");
-        }
-      }
+      const validation = await validateCortexTarget(target, targetConfig);
+      addLog(`${formatCortexValidation(targetConfig.label, validation)}\n`);
 
       addLog(
         `Configured target flash: ${formatBytes(targetConfig.flashSizeBytes)} ` +
@@ -1227,7 +1217,7 @@ export default function CortexProgrammer() {
       batchProbeIds.includes(probe.id)
     );
     if (selectedProbes.length === 0) {
-      alert("Selecciona al menos un programador para probar");
+      alert("Selecciona al menos un programador para validar");
       return;
     }
 
@@ -1238,7 +1228,7 @@ export default function CortexProgrammer() {
         {
           state: "waiting",
           progress: 0,
-          message: "Esperando prueba",
+          message: "Esperando validación",
         } satisfies BatchProbeStatus,
       ])
     );
@@ -1260,7 +1250,7 @@ export default function CortexProgrammer() {
     setProgress(0);
     setBatchStatuses(initialStatuses);
     addLog(
-      `\n=== Prueba de panel: ${selectedProbes.length} canal(es), target ${targetConfig.label}, SWD ${formatSwdClock(swdClockHz)} ===\n`
+      `\n=== Validación de panel: ${selectedProbes.length} canal(es), target ${targetConfig.label}, SWD ${formatSwdClock(swdClockHz)} ===\n`
     );
 
     const results = await Promise.allSettled(
@@ -1302,14 +1292,18 @@ export default function CortexProgrammer() {
             message: "Leyendo target",
           });
           await target.halt();
-          const cpuid = await target.readMem32(CORTEX_CPUID_ADDRESS);
-          channelLog(`SWD OK · CPUID ${formatHex32(cpuid)}\n`);
+          const validation = await validateCortexTarget(target, targetConfig);
+          const validationMessage = formatCortexValidation(
+            targetConfig.label,
+            validation
+          );
+          channelLog(`${validationMessage}\n`);
           await target.resume(false);
 
           updateProbeStatus(probe.id, {
             state: "success",
             progress: 100,
-            message: `SWD OK · CPUID ${formatHex32(cpuid)}`,
+            message: validationMessage,
           });
           return probe;
         } catch (err: unknown) {
@@ -1319,7 +1313,7 @@ export default function CortexProgrammer() {
             progress: 100,
             message,
           });
-          channelLog(`FALLO DE PRUEBA: ${message}\n`);
+          channelLog(`FALLO DE VALIDACIÓN: ${message}\n`);
           throw new Error(`${probe.label}: ${message}`, { cause: err });
         } finally {
           try {
@@ -1341,7 +1335,7 @@ export default function CortexProgrammer() {
     const failed = results.length - successful;
     setProgress(100);
     addLog(
-      `=== Prueba terminada: ${successful} correctos, ${failed} fallidos, ${results.length} total ===\n`
+      `=== Validación terminada: ${successful} correctos, ${failed} fallidos, ${results.length} total ===\n`
     );
     setConnectingTarget(false);
   }
@@ -1409,6 +1403,9 @@ export default function CortexProgrammer() {
 
       await target.halt();
       addLog("Core halted\n");
+
+      const validation = await validateCortexTarget(target, targetConfig);
+      addLog(`${formatCortexValidation(targetConfig.label, validation)}\n`);
 
       addLog(
         `Target: ${targetConfig.label}, image ${firmwareImage.format.toUpperCase()} ` +
@@ -1581,6 +1578,11 @@ export default function CortexProgrammer() {
 
           await target.halt();
           channelLog("Core detenido\n");
+
+          const validation = await validateCortexTarget(target, targetConfig);
+          channelLog(
+            `${formatCortexValidation(targetConfig.label, validation)}\n`
+          );
 
           const callbacks = {
             addLog: channelLog,
@@ -2299,7 +2301,7 @@ export default function CortexProgrammer() {
                     onClick={connectCortexTarget}
                     type="button"
                   >
-                    {connectingTarget ? "Conectando..." : "Probar uno"}
+                    {connectingTarget ? "Validando..." : "Validar uno"}
                   </button>
                   <button
                     className={`${buttonBase} border-slate-300 bg-white text-slate-600 hover:border-slate-500 hover:text-slate-900`}
@@ -2322,8 +2324,8 @@ export default function CortexProgrammer() {
                     type="button"
                   >
                     {connectingTarget
-                      ? "Probando lote..."
-                      : `Probar lote · ${selectedBatchProbeCount}`}
+                      ? "Validando lote..."
+                      : `Validar lote · ${selectedBatchProbeCount}`}
                   </button>
                   <button
                     className={`${buttonBase} border-cyan-500 bg-cyan-400 px-4 text-sm font-bold text-slate-950 shadow-sm hover:bg-cyan-300`}

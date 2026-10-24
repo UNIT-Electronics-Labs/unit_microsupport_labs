@@ -35,7 +35,13 @@ type EspPortSlot = {
   port: any;
 };
 type EspSlotFlashStatus = {
-  state: "waiting" | "programming" | "success" | "no_flash" | "error";
+  state:
+    | "waiting"
+    | "programming"
+    | "validated"
+    | "success"
+    | "no_flash"
+    | "error";
   progress: number;
   message?: string;
 };
@@ -47,6 +53,26 @@ type FirmwareCatalog = Record<
     micropython: string[];
   }
 >;
+
+function validateSelectedFamily(
+  esploader: ESPLoader,
+  selectedFamily: FirmwareFamily
+): string {
+  const detectedChip = esploader.chip?.CHIP_NAME;
+  const expectedChip = FAMILY_LABELS[selectedFamily];
+
+  if (!detectedChip) {
+    throw new Error("esptool no informó la arquitectura detectada.");
+  }
+
+  if (detectedChip !== expectedChip) {
+    throw new Error(
+      `Arquitectura incompatible: seleccionaste ${expectedChip}, pero la placa detectada es ${detectedChip}. No se escribió la flash.`
+    );
+  }
+
+  return detectedChip;
+}
 
 function createEmptyCatalog(): FirmwareCatalog {
   return {
@@ -76,6 +102,10 @@ function isMicroPythonFirmware(fileName: string): boolean {
 
 function getEspFlashErrorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
+
+  if (message.includes("Failed to fetch dynamically imported module")) {
+    return "El cargador del chip quedó desactualizado en la caché del navegador. Reinicia el servidor de desarrollo y recarga la página.";
+  }
 
   if (message.toLowerCase().includes("failed to connect with the device")) {
     return "Sin respuesta del bootloader. Mantén BOOT, pulsa RESET y programa a 115200 baud.";
@@ -661,6 +691,8 @@ export default function ESPFlasher() {
 
   async function flashFirmware() {
 
+    let activeTransport: Transport | null = null;
+
     try {
 
       if (!port) {
@@ -704,6 +736,7 @@ export default function ESPFlasher() {
       await delay(100);
 
       const transport = new Transport(port);
+      activeTransport = transport;
 
       const esploader = new ESPLoader({
 
@@ -726,8 +759,9 @@ export default function ESPFlasher() {
       });
 
       await esploader.main("default_reset");
+      const detectedChip = validateSelectedFamily(esploader, selectedFamily);
 
-      addLog("ESP detected successfully\n");
+      addLog(`${detectedChip} detectado y compatible con la selección.\n`);
 
       const firmwareBuffer = await firmwareToFlash.arrayBuffer();
 
@@ -775,6 +809,7 @@ export default function ESPFlasher() {
       setProgress(100);
 
       await esploader.transport.disconnect();
+      activeTransport = null;
 
       setConnected(false);
       setActivePort(null);
@@ -786,6 +821,12 @@ export default function ESPFlasher() {
     } catch (err: any) {
 
       console.error(err);
+
+      try {
+        await activeTransport?.disconnect();
+      } catch {
+        // Best-effort cleanup after detection or flash failure.
+      }
 
       if (isDeviceLostError(err) && port) {
         forgetLostPort(port, "El puerto se perdió durante la programación");
@@ -893,6 +934,13 @@ export default function ESPFlasher() {
             });
 
             await esploader.main("default_reset");
+            const detectedChip = validateSelectedFamily(
+              esploader,
+              selectedFamily
+            );
+            addLog(
+              `[${slot.label}] ${detectedChip} detectado y compatible.\n`
+            );
             await esploader.writeFlash({
               fileArray: [{ data: binary, address: parsedFlashAddress }],
               flashSize: "keep",
@@ -927,7 +975,7 @@ export default function ESPFlasher() {
               [slot.id]: {
                 state: "success",
                 progress: 100,
-                message: "Programado",
+                message: `Programado · ${detectedChip}`,
               },
             }));
             addLog(`[${slot.label}] Firmware programado correctamente.\n`);
@@ -961,6 +1009,139 @@ export default function ESPFlasher() {
     } catch (err: any) {
       console.error(err);
       addLog(`\nError preparando el lote: ${err.message}\n`);
+    } finally {
+      setFlashing(false);
+    }
+  }
+
+  async function validateSelectedESPs() {
+    const selectedSlots = espPortSlots.filter(
+      (slot): slot is EspPortSlot =>
+        slot !== null && selectedEspPortIds.includes(slot.id)
+    );
+
+    if (selectedSlots.length === 0) {
+      addLog("Selecciona al menos una estación ESP para validar.\n");
+      return;
+    }
+
+    try {
+      setFlashing(true);
+      setProgress(0);
+      setEspFlashStatuses(
+        Object.fromEntries(
+          selectedSlots.map((slot) => [
+            slot.id,
+            {
+              state: "waiting",
+              progress: 0,
+              message: "En espera para validar...",
+            },
+          ])
+        )
+      );
+      addLog(
+        `\nValidando arquitectura y memoria flash de ${selectedSlots.length} estación(es)...\n`
+      );
+
+      if (port && selectedSlots.some((slot) => slot.port === port)) {
+        await stopReading();
+      }
+
+      await Promise.all(
+        selectedSlots.map(async (slot) => {
+          let transport: Transport | null = null;
+
+          try {
+            setEspFlashStatuses((current) => ({
+              ...current,
+              [slot.id]: {
+                state: "programming",
+                progress: 20,
+                message: "Detectando chip y verificando flash...",
+              },
+            }));
+            addLog(`[${slot.label}] Iniciando validación...\n`);
+
+            try {
+              await slot.port.close();
+            } catch {
+              // The port can already be closed before esptool opens it.
+            }
+
+            transport = new Transport(slot.port);
+            const esploader = new ESPLoader({
+              transport,
+              baudrate: uploadBaudRate,
+              terminal: {
+                clean() {},
+                writeLine(data: string) {
+                  addLog(`[${slot.label}] ${data}\n`);
+                },
+                write(data: string) {
+                  addLog(`[${slot.label}] ${data}`);
+                },
+              },
+            });
+
+            await esploader.main("default_reset");
+            const detectedChip = validateSelectedFamily(
+              esploader,
+              selectedFamily
+            );
+            const flashDetected = await isFlashDetected(esploader);
+
+            await transport.disconnect();
+            transport = null;
+
+            setEspFlashStatuses((current) => ({
+              ...current,
+              [slot.id]: {
+                state: flashDetected ? "validated" : "no_flash",
+                progress: 100,
+                message: flashDetected
+                  ? `Validado · ${detectedChip}`
+                  : `${detectedChip} detectado; la memoria flash no respondió.`,
+              },
+            }));
+            addLog(
+              `[${slot.label}] ${
+                flashDetected
+                  ? `${detectedChip}: arquitectura, stub y flash validados.`
+                  : `${detectedChip}: arquitectura válida, flash sin respuesta.`
+              }\n`
+            );
+          } catch (error: unknown) {
+            const errorMessage = getEspFlashErrorMessage(error);
+            if (isDeviceLostError(error)) {
+              forgetLostPort(slot.port, "El puerto se perdió durante la validación");
+            }
+            setEspFlashStatuses((current) => ({
+              ...current,
+              [slot.id]: {
+                state: "error",
+                progress: 0,
+                message: errorMessage,
+              },
+            }));
+            addLog(`[${slot.label}] Validación fallida: ${errorMessage}\n`);
+            try {
+              await transport?.disconnect();
+            } catch {
+              // Best-effort cleanup after a failed validation.
+            }
+          }
+        })
+      );
+
+      setProgress(100);
+      if (port && selectedSlots.some((slot) => slot.port === port)) {
+        setConnected(false);
+        setActivePort(null);
+      }
+    } catch (error: unknown) {
+      console.error(error);
+      addLog(`\nError preparando la validación: ${getEspFlashErrorMessage(error)}\n`);
     } finally {
       setFlashing(false);
     }
@@ -1377,6 +1558,9 @@ export default function ESPFlasher() {
   const successfulEspCount = Object.values(espFlashStatuses).filter(
     (status) => status.state === "success"
   ).length;
+  const validatedEspCount = Object.values(espFlashStatuses).filter(
+    (status) => status.state === "validated"
+  ).length;
   const failedEspCount = Object.values(espFlashStatuses).filter(
     (status) => status.state === "error"
   ).length;
@@ -1385,7 +1569,6 @@ export default function ESPFlasher() {
   ).length;
 
   function selectFamily(family: FirmwareFamily) {
-    setFirmwareSource("web");
     setSelectedFamily(family);
 
     const nextChannel: FirmwareChannel =
@@ -1396,8 +1579,11 @@ export default function ESPFlasher() {
     setSelectedChannel(nextChannel);
     const nextFile = firmwareCatalog[family][nextChannel][0] ?? "";
     setSelectedFirmwareFile(nextFile);
-    if (nextFile) {
+    if (firmwareSource === "web" && nextFile) {
       void loadWebFirmwareByName(nextFile);
+    } else if (firmwareSource === "web") {
+      setFirmware(null);
+      setFirmwareName("");
     }
   }
 
@@ -1415,6 +1601,10 @@ export default function ESPFlasher() {
                 <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-slate-500">Lote / orden de producción</div>
                 <input className={inputClass} disabled={busy} onChange={(event) => setProductionOrder(event.target.value)} placeholder="Ej. OP-2026-0042" type="text" value={productionOrder} />
               </label>
+              <label className="grid gap-1 rounded border border-slate-300 bg-white p-2 text-[10px] font-semibold uppercase tracking-wide text-slate-500">Microcontrolador esperado
+                <select className={inputClass} disabled={busy} onChange={(event) => selectFamily(event.target.value as FirmwareFamily)} value={selectedFamily}>{FIRMWARE_FAMILIES.map((family) => <option key={family} value={family}>{FAMILY_LABELS[family]}</option>)}</select>
+                <span className="normal-case tracking-normal text-slate-500">Se comprobará contra el chip detectado antes de escribir.</span>
+              </label>
               <div className="grid grid-cols-2 rounded border border-slate-300 bg-slate-50 p-1">
                 <button className={`rounded px-2 py-1.5 text-xs font-bold transition ${firmwareSource === "local" ? "bg-cyan-400 text-slate-950 shadow-sm" : "text-slate-600 hover:bg-white"}`} disabled={busy} onClick={() => setFirmwareSource("local")} type="button">Archivo local</button>
                 <button className={`rounded px-2 py-1.5 text-xs font-bold transition ${firmwareSource === "web" ? "bg-cyan-400 text-slate-950 shadow-sm" : "text-slate-600 hover:bg-white"}`} disabled={busy} onClick={() => { setFirmwareSource("web"); if (selectedFirmwareFile) void loadWebFirmwareByName(selectedFirmwareFile); }} type="button">Catálogo web</button>
@@ -1430,9 +1620,6 @@ export default function ESPFlasher() {
                 </div>
               ) : (
                 <div className="grid gap-2 rounded border border-slate-300 bg-white p-2">
-                  <label className="grid gap-1 text-[10px] font-semibold uppercase tracking-wide text-slate-500">Microcontrolador
-                    <select className={inputClass} disabled={busy} onChange={(event) => selectFamily(event.target.value as FirmwareFamily)} value={selectedFamily}>{FIRMWARE_FAMILIES.map((family) => <option key={family} value={family}>{FAMILY_LABELS[family]}</option>)}</select>
-                  </label>
                   <label className="grid gap-1 text-[10px] font-semibold uppercase tracking-wide text-slate-500">Canal
                     <select className={inputClass} disabled={busy} onChange={(event) => { const channel = event.target.value as FirmwareChannel; setFirmwareSource("web"); setSelectedChannel(channel); const file = firmwareCatalog[selectedFamily][channel][0] ?? ""; setSelectedFirmwareFile(file); if (file) void loadWebFirmwareByName(file); }} value={selectedChannel}><option value="standard">Estándar</option><option value="micropython">MicroPython</option></select>
                   </label>
@@ -1480,18 +1667,18 @@ export default function ESPFlasher() {
                     }
 
                     return (
-                      <div className={`relative grid min-h-28 min-w-0 content-between gap-2 rounded-md border p-2.5 text-xs shadow-sm ${status?.state === "success" ? "border-emerald-200 bg-emerald-50 text-emerald-800" : status?.state === "no_flash" ? "border-sky-200 bg-sky-50 text-sky-800" : status?.state === "programming" || status?.state === "waiting" ? "border-cyan-200 bg-cyan-50 text-cyan-800" : status?.state === "error" ? "border-red-200 bg-red-50 text-red-800" : isActive ? "border-emerald-200 bg-emerald-50 text-emerald-800" : "border-slate-200 bg-white text-slate-700"}`} key={slot.id}>
+                      <div className={`relative grid min-h-28 min-w-0 content-between gap-2 rounded-md border p-2.5 text-xs shadow-sm ${status?.state === "success" ? "border-emerald-200 bg-emerald-50 text-emerald-800" : status?.state === "validated" ? "border-violet-200 bg-violet-50 text-violet-800" : status?.state === "no_flash" ? "border-sky-200 bg-sky-50 text-sky-800" : status?.state === "programming" || status?.state === "waiting" ? "border-cyan-200 bg-cyan-50 text-cyan-800" : status?.state === "error" ? "border-red-200 bg-red-50 text-red-800" : isActive ? "border-emerald-200 bg-emerald-50 text-emerald-800" : "border-slate-200 bg-white text-slate-700"}`} key={slot.id}>
                         <span className="absolute right-2 top-2 grid size-6 place-items-center rounded-full border border-current/15 bg-white/70 font-mono text-[10px] font-bold opacity-70">{slotIndex + 1}</span>
-                        <label className="flex min-w-0 cursor-pointer items-start gap-2 pr-7"><input checked={selectedEspPortIds.includes(slot.id)} className="mt-0.5 shrink-0" disabled={busy} onChange={(event) => setSelectedEspPortIds((current) => event.target.checked ? [...current, slot.id] : current.filter((portId) => portId !== slot.id))} type="checkbox" /><span className="min-w-0"><span className="block truncate text-sm font-bold">ESP asignado</span><span className="mt-1 block truncate font-mono text-[10px] opacity-75">{slot.label}</span><span className={`mt-1 block text-[10px] font-bold ${status?.state === "programming" || status?.state === "waiting" ? "animate-pulse" : ""}`}>{status?.state === "success" ? "PROGRAMADO" : status?.state === "no_flash" ? "FLASH NO VERIFICADA" : status?.state === "error" ? "ERROR" : status?.state === "programming" ? "EN PROCESO..." : status?.state === "waiting" ? "EN ESPERA..." : isActive ? "ACTIVO" : "Disponible"}</span>{(status?.state === "error" || status?.state === "no_flash" || status?.state === "programming" || status?.state === "waiting") && status.message ? <span className="mt-1 block text-[10px] leading-tight" title={status.message}>{status.message}</span> : null}</span></label>
-                        {status ? <div className="h-1.5 overflow-hidden rounded-full bg-white/80"><div className={`h-full rounded-full ${status.state === "error" ? "bg-red-500" : status.state === "success" ? "bg-emerald-500" : status.state === "no_flash" ? "bg-sky-500" : "bg-cyan-500"}`} style={{ width: `${status.progress}%` }} /></div> : null}
+                        <label className="flex min-w-0 cursor-pointer items-start gap-2 pr-7"><input checked={selectedEspPortIds.includes(slot.id)} className="mt-0.5 shrink-0" disabled={busy} onChange={(event) => setSelectedEspPortIds((current) => event.target.checked ? [...current, slot.id] : current.filter((portId) => portId !== slot.id))} type="checkbox" /><span className="min-w-0"><span className="block truncate text-sm font-bold">ESP asignado</span><span className="mt-1 block truncate font-mono text-[10px] opacity-75">{slot.label}</span><span className={`mt-1 block text-[10px] font-bold ${status?.state === "programming" || status?.state === "waiting" ? "animate-pulse" : ""}`}>{status?.state === "success" ? "PROGRAMADO" : status?.state === "validated" ? "VALIDADO" : status?.state === "no_flash" ? "FLASH NO VERIFICADA" : status?.state === "error" ? "ERROR" : status?.state === "programming" ? "EN PROCESO..." : status?.state === "waiting" ? "EN ESPERA..." : isActive ? "ACTIVO" : "Disponible"}</span>{status?.message ? <span className="mt-1 block text-[10px] leading-tight" title={status.message}>{status.message}</span> : null}</span></label>
+                        {status ? <div className="h-1.5 overflow-hidden rounded-full bg-white/80"><div className={`h-full rounded-full ${status.state === "error" ? "bg-red-500" : status.state === "success" ? "bg-emerald-500" : status.state === "validated" ? "bg-violet-500" : status.state === "no_flash" ? "bg-sky-500" : "bg-cyan-500"}`} style={{ width: `${status.progress}%` }} /></div> : null}
                         <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-1.5"><button className="rounded border border-current/20 bg-white/70 px-1.5 py-1 text-[10px] font-bold hover:bg-white disabled:opacity-50" disabled={busy || isActive} onClick={() => void selectEspPortSlot(slotIndex)} type="button">{isActive ? "Estación activa" : "Seleccionar"}</button><button className="rounded border border-current/20 bg-white/70 px-2 py-1 text-[10px] font-bold hover:bg-white disabled:opacity-50" disabled={busy} onClick={() => void removeEspPortSlot(slotIndex)} type="button">Quitar</button></div>
                       </div>
                     );
                   })}
                 </div>
                 <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded border border-slate-200 bg-white p-2">
-                  <div className="flex items-center gap-3 text-[10px] font-bold uppercase tracking-wide text-slate-500"><span><strong className="font-mono text-emerald-600">{successfulEspCount}</strong> OK</span><span><strong className="font-mono text-sky-600">{noFlashEspCount}</strong> Sin flash</span><span><strong className="font-mono text-red-600">{failedEspCount}</strong> Error</span></div>
-                  <div className="flex flex-wrap gap-1.5"><button className={`${buttonBase} border-slate-300 bg-white px-3 text-slate-700 hover:border-slate-500 hover:text-slate-900`} disabled={busy || selectedEspSlotCount === 0} onClick={() => void resetSelectedESPs()} type="button">{flashing ? "Procesando lote..." : `Reset seleccionados · ${selectedEspSlotCount}`}</button><button className={`${buttonBase} border-amber-500 bg-amber-50 px-3 text-amber-900 hover:bg-amber-100`} disabled={busy || selectedEspSlotCount === 0} onClick={() => void eraseSelectedESPs()} type="button">{flashing ? "Procesando lote..." : `Borrar seleccionados · ${selectedEspSlotCount}`}</button><button className={`${buttonBase} border-cyan-500 bg-cyan-400 px-4 text-sm font-bold text-slate-950 shadow-sm hover:bg-cyan-300`} disabled={busy || !firmware || selectedEspSlotCount === 0} onClick={() => void flashSelectedESPs()} type="button">{flashing ? "Programando lote..." : `Programar seleccionados · ${selectedEspSlotCount}`}</button></div>
+                  <div className="flex items-center gap-3 text-[10px] font-bold uppercase tracking-wide text-slate-500"><span><strong className="font-mono text-emerald-600">{successfulEspCount}</strong> Programado</span><span><strong className="font-mono text-violet-600">{validatedEspCount}</strong> Validado</span><span><strong className="font-mono text-sky-600">{noFlashEspCount}</strong> Sin flash</span><span><strong className="font-mono text-red-600">{failedEspCount}</strong> Error</span></div>
+                  <div className="flex flex-wrap gap-1.5"><button className={`${buttonBase} border-violet-400 bg-violet-50 px-3 text-violet-900 hover:bg-violet-100`} disabled={busy || selectedEspSlotCount === 0} onClick={() => void validateSelectedESPs()} type="button">{flashing ? "Procesando lote..." : `Validar seleccionados · ${selectedEspSlotCount}`}</button><button className={`${buttonBase} border-slate-300 bg-white px-3 text-slate-700 hover:border-slate-500 hover:text-slate-900`} disabled={busy || selectedEspSlotCount === 0} onClick={() => void resetSelectedESPs()} type="button">{flashing ? "Procesando lote..." : `Reset seleccionados · ${selectedEspSlotCount}`}</button><button className={`${buttonBase} border-amber-500 bg-amber-50 px-3 text-amber-900 hover:bg-amber-100`} disabled={busy || selectedEspSlotCount === 0} onClick={() => void eraseSelectedESPs()} type="button">{flashing ? "Procesando lote..." : `Borrar seleccionados · ${selectedEspSlotCount}`}</button><button className={`${buttonBase} border-cyan-500 bg-cyan-400 px-4 text-sm font-bold text-slate-950 shadow-sm hover:bg-cyan-300`} disabled={busy || !firmware || selectedEspSlotCount === 0} onClick={() => void flashSelectedESPs()} type="button">{flashing ? "Programando lote..." : `Programar seleccionados · ${selectedEspSlotCount}`}</button></div>
                 </div>
               </fieldset>
             </div>

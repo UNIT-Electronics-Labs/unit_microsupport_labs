@@ -5,9 +5,11 @@
   "type": "module",
   "scripts": {
     "generate:firmware-manifest": "node scripts/generate-firmware-manifest.mjs",
+    "validate:esp-architectures": "node scripts/validate-esp-architectures.mjs",
+    "validate:cortex-targets": "node scripts/validate-cortex-targets.mjs",
     "predev": "npm run generate:firmware-manifest",
     "dev": "vite",
-    "prebuild": "npm run generate:firmware-manifest",
+    "prebuild": "npm run generate:firmware-manifest && npm run validate:esp-architectures && npm run validate:cortex-targets",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview"
@@ -15,6 +17,7 @@
   "dependencies": {
     "dapjs": "^2.3.0",
     "esptool-js": "^0.6.0",
+    "qrcode": "^1.5.4",
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
     "xterm": "^5.3.0"
@@ -26,6 +29,7 @@
     "@tailwindcss/vite": "^4.3.0",
     "@types/babel__core": "^7.20.5",
     "@types/node": "^24.13.2",
+    "@types/qrcode": "^1.5.6",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.1",

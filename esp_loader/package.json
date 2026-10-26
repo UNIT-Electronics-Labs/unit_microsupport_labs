@@ -12,6 +12,7 @@
     "prebuild": "npm run generate:firmware-manifest && npm run validate:esp-architectures && npm run validate:cortex-targets",
     "build": "tsc -b && vite build",
     "test:webhid": "node --test scripts/webhid.test.mjs",
+    "test:validation": "node scripts/cortex-validation.test.mjs",
     "lint": "eslint .",
     "preview": "vite preview"
   },

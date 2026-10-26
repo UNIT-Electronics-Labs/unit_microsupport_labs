@@ -5,8 +5,8 @@ import {
   type Transport as DapTransport,
   WebUSB as DapWebUSB,
 } from "dapjs";
-import { flashPy32F0, PY32_DAP_WAIT_RETRY } from "../cortex/flash/py32f0";
-import { flashStm32F1 } from "../cortex/flash/stm32f1";
+import { flashPy32F0, PY32_DAP_WAIT_RETRY, PY32_DBGMCU_IDCODE_ADDRESS } from "../cortex/flash/py32f0";
+import { flashStm32F1, STM32_DBGMCU_IDCODE_ADDRESS } from "../cortex/flash/stm32f1";
 import { parseFirmwareImage } from "../cortex/firmware";
 import { TARGETS, type TargetKey } from "../cortex/targets";
 import {
@@ -16,6 +16,8 @@ import {
 import {
   formatBytes,
   formatHex32,
+  getDebugDeviceId,
+  getDebugRevisionId,
   getErrorMessage,
 } from "../cortex/utils";
 import { WebHidCmsisDapTransport, type WebHidApi, type WebHidDevice } from "../cortex/webhid";
@@ -394,7 +396,10 @@ export default function CortexProgrammer({
     useState<FamilyFilter>(initialFamily);
   const [targetSearch, setTargetSearch] = useState("");
   const [swdClockHz, setSwdClockHz] = useState(DEFAULT_SWD_CLOCK_HZ);
-  const [configurationOpen, setConfigurationOpen] = useState(true);
+  const [configurationOpen, setConfigurationOpen] = useState(() =>
+    typeof window !== "undefined" &&
+    window.matchMedia("(min-width: 1024px)").matches
+  );
   const [cmsisTransport, setCmsisTransport] =
     useState<CmsisTransportKind>(initialTransport);
   const [detectedProbe, setDetectedProbe] = useState("");
@@ -1091,6 +1096,21 @@ export default function CortexProgrammer({
       const validation = await validateCortexTarget(target, targetConfig);
       addLog(`${formatCortexValidation(targetConfig.label, validation)}\n`);
 
+      try {
+        const debugId = await target.readMem32(
+          targetConfig.algorithm === "py32f0"
+            ? PY32_DBGMCU_IDCODE_ADDRESS
+            : STM32_DBGMCU_IDCODE_ADDRESS
+        );
+        addLog(
+          `DBGMCU_IDCODE: ${formatHex32(debugId)} ` +
+            `(dev ${formatHex32(getDebugDeviceId(debugId))}, ` +
+            `rev 0x${getDebugRevisionId(debugId).toString(16).padStart(4, "0")})\n`
+        );
+      } catch {
+        addLog("DBGMCU_IDCODE: no disponible\n");
+      }
+
       addLog(
         `Configured target flash: ${formatBytes(targetConfig.flashSizeBytes)} ` +
           `at ${formatHex32(targetConfig.flashBase)}\n`
@@ -1601,16 +1621,27 @@ export default function CortexProgrammer({
 
   return (
     <main className="min-h-[calc(100vh-65px)] w-full">
-      <section className="min-h-[calc(100vh-65px)] overflow-hidden border-y border-slate-800 bg-slate-100">
+      <section className="min-h-[calc(100vh-65px)] overflow-x-clip border-y border-slate-800 bg-slate-100">
         <div
-          className={`grid min-w-0 gap-0 ${
+          className={`grid min-w-0 grid-cols-1 gap-0 ${
             configurationOpen
-              ? "xl:grid-cols-[330px_minmax(0,1fr)]"
-              : "grid-cols-1"
+              ? "lg:grid-cols-[330px_minmax(0,1fr)]"
+              : ""
           }`}
         >
           {configurationOpen ? (
-          <div className="grid min-w-0 content-start gap-2">
+            <button
+              aria-label="Cerrar configuración"
+              className="fixed inset-0 z-30 bg-slate-950/50 lg:hidden"
+              onClick={() => setConfigurationOpen(false)}
+              type="button"
+            />
+          ) : null}
+          {configurationOpen ? (
+            <div
+              className="fixed inset-y-0 left-0 z-40 grid w-[calc(100vw-3rem)] max-w-[330px] min-w-0 content-start gap-2 overflow-y-auto bg-slate-100 shadow-xl lg:sticky lg:top-[75px] lg:z-auto lg:max-h-[calc(100dvh-75px)] lg:w-auto lg:max-w-none lg:self-start lg:shadow-none"
+              id="cortex-configuration"
+            >
             <div className="border-b border-r border-slate-300 bg-white p-3">
               <div className="mb-2 flex items-center justify-between">
                 <div className="text-sm font-bold text-slate-950">
@@ -1785,13 +1816,14 @@ export default function CortexProgrammer({
             >
               Listo · ocultar configuración
             </button>
-          </div>
+            </div>
           ) : null}
 
           <aside className="min-w-0 bg-slate-100 p-2 lg:p-3">
             <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
               <div className="flex min-w-0 items-center gap-2">
                 <button
+                  aria-expanded={configurationOpen}
                   className="shrink-0 rounded border border-slate-300 bg-white px-2 py-1 text-xs font-bold text-slate-700 hover:border-cyan-500 hover:text-cyan-800 disabled:opacity-50"
                   disabled={busy}
                   onClick={() =>

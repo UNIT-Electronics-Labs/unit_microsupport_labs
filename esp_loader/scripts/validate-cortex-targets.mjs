@@ -56,10 +56,9 @@ async function main() {
       Number.isInteger(target.flashSizeBytes) && target.flashSizeBytes > 0,
       `${key}: tamaño de flash inválido`
     );
-    assert(
-      Number.isInteger(target.flashSizeAddress) && target.flashSizeAddress > 0,
-      `${key}: falta el registro físico de tamaño de flash`
-    );
+    if (key === "py32f002ax5") {
+      assert(target.flashSizeBytes === 20 * 1024, `${key}: flash esperada de 20 KB`);
+    }
     assert(
       Number.isInteger(target.pageSize) && target.pageSize > 0,
       `${key}: tamaño de página inválido`
@@ -104,9 +103,8 @@ async function main() {
   for (const requiredCheck of [
     "CORTEX_M0_PLUS_PART_NUMBER",
     "CORTEX_M3_PART_NUMBER",
-    "GD32_FMC_PRODUCT_ID_ADDRESS",
-    "PY32_DEBUG_ID_ADDRESS",
-    "flashSizeAddress",
+    "CORTEX_CPUID_ADDRESS",
+    "configuredFlashSizeKb",
   ]) {
     assert(
       runtimeValidation.includes(requiredCheck),
@@ -118,7 +116,7 @@ async function main() {
     familia: family.toUpperCase(),
     targets: entries.filter(([, target]) => target.family === family).length,
     algoritmo: expectedAlgorithm[family],
-    validacion: "núcleo + identidad + flash",
+    validacion: "núcleo + capacidad configurada",
   }));
 
   console.table(results);

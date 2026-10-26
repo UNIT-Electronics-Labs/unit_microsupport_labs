@@ -18,7 +18,6 @@ export type Stm32F1TargetConfig = {
   algorithm: "stm32f1";
   flashBase: number;
   flashSizeBytes: number;
-  flashSizeAddress: number;
   pageSize: number;
   deviceId?: number;
 };
@@ -30,7 +29,6 @@ export type Py32F0TargetConfig = {
   algorithm: "py32f0";
   flashBase: number;
   flashSizeBytes: number;
-  flashSizeAddress: number;
   pageSize: number;
   programPageSize: number;
   timingProfile: "py32f0" | "py32f071";

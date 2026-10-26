@@ -18,6 +18,7 @@ import {
   formatHex32,
   getErrorMessage,
 } from "../cortex/utils";
+import { WebHidCmsisDapTransport, type WebHidApi, type WebHidDevice } from "../cortex/webhid";
 
 const DEFAULT_SWD_CLOCK_HZ = 1_000_000;
 const MAX_PANEL_SLOTS = 10;
@@ -74,29 +75,6 @@ const SWD_CLOCK_OPTIONS = [
   { value: 10_000_000, label: "10 MHz · máxima velocidad" },
 ] as const;
 
-type WebHidInputReportEvent = Event & {
-  data: DataView;
-};
-
-type WebHidDevice = EventTarget & {
-  opened: boolean;
-  productName?: string;
-  manufacturerName?: string;
-  serialNumber?: string;
-  vendorId?: number;
-  productId?: number;
-  open(): Promise<void>;
-  close(): Promise<void>;
-  sendReport(reportId: number, data: BufferSource): Promise<void>;
-};
-
-type WebHidApi = {
-  getDevices?: () => Promise<WebHidDevice[]>;
-  requestDevice(options: { filters: unknown[] }): Promise<WebHidDevice[]>;
-  addEventListener?: (type: string, listener: EventListener) => void;
-  removeEventListener?: (type: string, listener: EventListener) => void;
-};
-
 type FileSystemFileHandleLike = {
   getFile(): Promise<File>;
   queryPermission?: (descriptor?: { mode?: "read" }) => Promise<PermissionState>;
@@ -138,19 +116,10 @@ const KNOWN_CMSIS_DAP_IDS: Array<{ vendorId: number; productId?: number }> = [
   { vendorId: 0x1209, productId: 0x3443 },
   { vendorId: 0x1209, productId: 0x3444 },
 ];
-
-const PREFER_WEBUSB_DUAL_MODE_IDS = [
-  { vendorId: 0x0d28, productId: 0x0203 },
-  { vendorId: 0x0d28, productId: 0x0204 },
-  { vendorId: 0x0d28, productId: 0x0205 },
-] as const;
-
-function prefersWebUsbDualMode(device: WebUsbDeviceInfo): boolean {
-  return PREFER_WEBUSB_DUAL_MODE_IDS.some(
-    ({ vendorId, productId }) =>
-      device.vendorId === vendorId && device.productId === productId
-  );
-}
+const KNOWN_CMSIS_DAP_HID_IDS = [
+  ...KNOWN_CMSIS_DAP_IDS,
+  { vendorId: 0x1a86, productId: 0x8011 }, // QinHeng CMSIS-DAP v1
+];
 
 function looksLikeCmsisDapDevice(device: {
   productName?: string;
@@ -168,7 +137,7 @@ function looksLikeCmsisDapDevice(device: {
     .join(" ")
     .toLowerCase();
 
-  const hasKnownCmsisDapId = KNOWN_CMSIS_DAP_IDS.some(
+  const hasKnownCmsisDapId = KNOWN_CMSIS_DAP_HID_IDS.some(
     ({ vendorId, productId }) =>
       device.vendorId === vendorId &&
       (productId === undefined || device.productId === productId)
@@ -233,14 +202,23 @@ function hasCmsisDapV2Interface(device: WebUsbDeviceInfo): boolean {
   );
 }
 
+function hasVendorSpecificUsbInterface(device: WebUsbDeviceInfo): boolean {
+  return device.configurations?.some((configuration) =>
+    configuration.interfaces.some((usbInterface) =>
+      usbInterface.alternates.some((alternate) => alternate.interfaceClass === 0xff)
+    )
+  ) ?? false;
+}
+
 function getWebUsbCmsisDapDevices(devices: unknown[]): WebUsbDeviceInfo[] {
-  return getCmsisDapDevices(devices).filter((device) => {
+  return devices.map((device) => device as WebUsbDeviceInfo).filter((device) => {
     const hasKnownV2Id = KNOWN_CMSIS_DAP_IDS.some(
       ({ vendorId, productId }) =>
         device.vendorId === vendorId &&
         (productId === undefined || device.productId === productId)
     );
-    return hasKnownV2Id || hasCmsisDapV2Interface(device);
+    return hasCmsisDapV2Interface(device) ||
+      (hasKnownV2Id && looksLikeCmsisDapDevice(device) && hasVendorSpecificUsbInterface(device));
   });
 }
 
@@ -298,55 +276,6 @@ function createAuthorizedProbe(
   };
 }
 
-class WebHidCmsisDapTransport implements DapTransport {
-  public readonly packetSize = 64;
-
-  private device: WebHidDevice;
-
-  constructor(device: WebHidDevice) {
-    this.device = device;
-  }
-
-  async open(): Promise<void> {
-    if (!this.device.opened) {
-      await this.device.open();
-    }
-  }
-
-  async close(): Promise<void> {
-    if (this.device.opened) {
-      await this.device.close();
-    } 
-  }
-
-  async read(): Promise<DataView> {
-    return await new Promise((resolve) => {
-      const onInputReport = (event: Event) => {
-        this.device.removeEventListener("inputreport", onInputReport);
-        const data = (event as WebHidInputReportEvent).data;
-        resolve(
-          new DataView(
-            data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)
-          )
-        );
-      };
-
-      this.device.addEventListener("inputreport", onInputReport);
-    });
-  }
-
-  async write(data: BufferSource): Promise<void> {
-    const source =
-      data instanceof ArrayBuffer
-        ? new Uint8Array(data)
-        : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-
-    const packet = new Uint8Array(this.packetSize);
-    packet.set(source.slice(0, this.packetSize));
-    await this.device.sendReport(0, packet);
-  }
-}
-
 class FlexibleWebUsbTransport implements DapTransport {
   public readonly packetSize = 64;
 
@@ -365,12 +294,15 @@ class FlexibleWebUsbTransport implements DapTransport {
       return;
     }
 
-    const candidates = [
-      { label: "vendor-specific", interfaceClass: 0xff, configuration: 1 },
-      { label: "cdc", interfaceClass: 0x03, configuration: 1 },
-      { label: "cdc-data", interfaceClass: 0x0a, configuration: 1 },
-      { label: "default", interfaceClass: 0x00, configuration: 1 },
-    ];
+    const configurations = this.device.configurations.length > 0
+      ? this.device.configurations.map((config) => config.configurationValue)
+      : [1];
+    const candidates = configurations.flatMap((configuration) => [
+      { label: "vendor-specific", interfaceClass: 0xff, configuration },
+      { label: "hid", interfaceClass: 0x03, configuration },
+      { label: "cdc-data", interfaceClass: 0x0a, configuration },
+      { label: "default", interfaceClass: 0x00, configuration },
+    ]);
 
     const failures: string[] = [];
 
@@ -385,13 +317,15 @@ class FlexibleWebUsbTransport implements DapTransport {
         await transport.open();
         this.activeTransport = transport;
         this.log?.(
-          `WebUSB interface selected: ${candidate.label} (class 0x${candidate.interfaceClass.toString(16).padStart(2, "0")})\n`
+          `WebUSB interface selected: ${candidate.label}, configuration ${candidate.configuration} ` +
+          `(class 0x${candidate.interfaceClass.toString(16).padStart(2, "0")})\n`
         );
         return;
       } catch (err: unknown) {
         failures.push(
-          `${candidate.label}: ${getErrorMessage(err)}`
+          `${candidate.label} / configuration ${candidate.configuration}: ${getErrorMessage(err)}`
         );
+        await transport.close().catch(() => undefined);
       }
     }
 
@@ -543,23 +477,31 @@ export default function CortexProgrammer({
     ).usb;
     const hid = (navigator as Navigator & { hid?: WebHidApi }).hid;
 
-    if (!usb?.getDevices && !hid?.getDevices) return [];
+    if (!usb?.getDevices && !hid?.getDevices) {
+      setLogs((previous) => previous +
+        `${reason ?? "Escaneo inicial"}: WebUSB y WebHID no están disponibles. ` +
+        "Abre la URL HTTPS en Chrome o Edge de escritorio.\n");
+      return [];
+    }
 
     setScanningProbes(true);
     try {
-      const [usbDevices, hidDevices] = await Promise.all([
+      const [usbResult, hidResult] = await Promise.allSettled([
         usb?.getDevices?.() ?? Promise.resolve([]),
         hid?.getDevices?.() ?? Promise.resolve([]),
       ]);
+      const usbDevices = usbResult.status === "fulfilled" ? usbResult.value : [];
+      const hidDevices = hidResult.status === "fulfilled" ? hidResult.value : [];
+      if (usbResult.status === "rejected") {
+        addLog(`WebUSB: no se pudo consultar permisos: ${getErrorMessage(usbResult.reason)}\n`);
+      }
+      if (hidResult.status === "rejected") {
+        addLog(`WebHID: no se pudo consultar permisos: ${getErrorMessage(hidResult.reason)}\n`);
+      }
       const webUsbProbes = getWebUsbCmsisDapDevices(usbDevices);
       const webHidProbes = getCmsisDapDevices(hidDevices).filter(
         (hidDevice) =>
-          !webUsbProbes.some((usbDevice) =>
-            isSamePhysicalProbe(usbDevice, hidDevice) ||
-            (prefersWebUsbDualMode(hidDevice) &&
-              usbDevice.vendorId === hidDevice.vendorId &&
-              usbDevice.productId === hidDevice.productId)
-          )
+          !webUsbProbes.some((usbDevice) => isSamePhysicalProbe(usbDevice, hidDevice))
       );
       const rememberedProbes = [
         ...webUsbProbes.map((device, index) =>
@@ -624,7 +566,9 @@ export default function CortexProgrammer({
         setLogs(
           (previous) =>
             previous +
-            `${reason}: ${rememberedProbes.length} programador(es) CMSIS-DAP conectado(s).\n`
+            `${reason}: ${rememberedProbes.length} programador(es) CMSIS-DAP; ` +
+            `WebUSB ${webUsbProbes.length}/${usbDevices.length}, ` +
+            `WebHID ${webHidProbes.length}/${hidDevices.length} (detectados/autorizados).\n`
         );
       }
 
@@ -655,7 +599,7 @@ export default function CortexProgrammer({
       void scanAuthorizedProbes("Cambio de conexión detectado");
     };
 
-    void scanAuthorizedProbes();
+    void scanAuthorizedProbes("Escaneo inicial");
     usb?.addEventListener?.("connect", handleDeviceChange);
     usb?.addEventListener?.("disconnect", handleDeviceChange);
     hid?.addEventListener?.("connect", handleDeviceChange);
@@ -809,9 +753,7 @@ export default function CortexProgrammer({
         addLog(
           "Abriendo selector WebUSB. Elige un CMSIS-DAP v2 conectado.\n"
         );
-        selectedDevice = (await usb.requestDevice({
-          filters: KNOWN_CMSIS_DAP_IDS,
-        })) as WebUsbDeviceInfo;
+        selectedDevice = (await usb.requestDevice({ filters: [] })) as WebUsbDeviceInfo;
       } else {
         const hid = getHidApi();
         if (!hid) {
@@ -833,11 +775,6 @@ export default function CortexProgrammer({
           );
         }
 
-        if (prefersWebUsbDualMode(selectedDevice)) {
-          throw new Error(
-            `${selectedDevice.productName ?? "Este CMSIS-DAP"} expone v1 y v2 en el mismo dispositivo. Asígnalo con el botón v2 / USB para evitar usar ambas interfaces simultáneamente.`
-          );
-        }
       }
 
       const probes = await scanAuthorizedProbes(
@@ -855,24 +792,27 @@ export default function CortexProgrammer({
         ) ??
         null;
 
-      if (selectedProbe) {
-        setSelectedProbeId(selectedProbe.id);
-        setDetectedProbe(selectedProbe.label);
+      if (selectedDevice) {
+        // getDevices() can lag behind requestDevice(), especially on the first
+        // grant for this origin. Keep the device returned by the chooser.
+        const probe = selectedProbe ?? rememberSelectedProbe(selectedDevice, transportKind);
+        setSelectedProbeId(probe.id);
+        setDetectedProbe(probe.label);
         setCmsisTransport("auto");
         if (slotIndex !== undefined) {
           setPanelSlotProbeIds((current) =>
             current.map((probeId, index) => {
-              if (index === slotIndex) return selectedProbe.id;
-              return probeId === selectedProbe.id ? null : probeId;
+              if (index === slotIndex) return probe.id;
+              return probeId === probe.id ? null : probeId;
             })
           );
           setBatchProbeIds((current) =>
-            current.includes(selectedProbe.id)
+            current.includes(probe.id)
               ? current
-              : [...current, selectedProbe.id]
+              : [...current, probe.id]
           );
         }
-        addLog(`CMSIS-DAP autorizado: ${selectedProbe.label}\n`);
+        addLog(`CMSIS-DAP autorizado: ${probe.label}\n`);
       }
     } catch (err: unknown) {
       addLog(
@@ -892,7 +832,7 @@ export default function CortexProgrammer({
     if (probe.transport === "webusb") {
       const usb = getUsbApi();
       const connectedDevices = getWebUsbCmsisDapDevices(
-        (await usb?.getDevices?.()) ?? []
+        (await usb?.getDevices?.().catch(() => [])) ?? []
       );
       const connectedDevice =
         connectedDevices.find(
@@ -904,13 +844,7 @@ export default function CortexProgrammer({
         connectedDevices.find((device) =>
           isSamePhysicalProbe(device, rememberedDevice)
         ) ??
-        null;
-
-      if (!connectedDevice) {
-        throw new Error(
-          `${probe.label}: programador WebUSB desconectado o sin autorización`
-        );
-      }
+        rememberedDevice;
 
       return {
         ...probe,
@@ -919,7 +853,7 @@ export default function CortexProgrammer({
     }
 
     const hid = getHidApi();
-    const connectedDevices = (await hid?.getDevices?.()) ?? [];
+    const connectedDevices = (await hid?.getDevices?.().catch(() => [])) ?? [];
     const connectedDevice =
       connectedDevices.find((device) => device === probe.device) ??
       connectedDevices.find(
@@ -927,13 +861,7 @@ export default function CortexProgrammer({
           device.vendorId === rememberedDevice.vendorId &&
           device.productId === rememberedDevice.productId &&
           looksLikeCmsisDapDevice(device)
-      ) ?? null;
-
-    if (!connectedDevice) {
-      throw new Error(
-        `${probe.label}: programador WebHID desconectado o sin autorización`
-      );
-    }
+      ) ?? (probe.device as WebHidDevice);
 
     return {
       ...probe,
@@ -972,19 +900,18 @@ export default function CortexProgrammer({
         );
       }
 
-      const [usbDevices, hidDevices] = await Promise.all([
+      const [usbResult, hidResult] = await Promise.allSettled([
         usb?.getDevices?.() ?? Promise.resolve([]),
         hid?.getDevices?.() ?? Promise.resolve([]),
       ]);
+      const usbDevices = usbResult.status === "fulfilled" ? usbResult.value : [];
+      const hidDevices = hidResult.status === "fulfilled" ? hidResult.value : [];
       const authorizedUsbDevices = getWebUsbCmsisDapDevices(usbDevices);
       const authorizedHidDevices = hidDevices.filter(
         (device) =>
           looksLikeCmsisDapDevice(device) &&
           !authorizedUsbDevices.some((usbDevice) =>
-            isSamePhysicalProbe(usbDevice, device) ||
-            (prefersWebUsbDualMode(device) &&
-              usbDevice.vendorId === device.vendorId &&
-              usbDevice.productId === device.productId)
+            isSamePhysicalProbe(usbDevice, device)
           )
       );
 
@@ -1018,7 +945,7 @@ export default function CortexProgrammer({
       }
 
       try {
-        const rememberedDevices = (await hid.getDevices?.()) ?? [];
+        const rememberedDevices = (await hid.getDevices?.().catch(() => [])) ?? [];
         const rememberedDevice =
           selectedAuthorizedProbe?.transport === "webhid"
             ? (selectedAuthorizedProbe.device as WebHidDevice)
@@ -1027,11 +954,7 @@ export default function CortexProgrammer({
                     device.vendorId === 0x1a86 &&
                     device.productId === 0x8011
                 ) ??
-              rememberedDevices.find(
-                (device) =>
-                  looksLikeCmsisDapDevice(device) &&
-                  !prefersWebUsbDualMode(device)
-              ) ??
+              rememberedDevices.find((device) => looksLikeCmsisDapDevice(device)) ??
               null;
 
         if (rememberedDevice) {
@@ -1055,9 +978,7 @@ export default function CortexProgrammer({
         });
         const device =
           devices.find(
-            (currentDevice) =>
-              looksLikeCmsisDapDevice(currentDevice) &&
-              !prefersWebUsbDualMode(currentDevice)
+            (currentDevice) => looksLikeCmsisDapDevice(currentDevice)
           ) ?? null;
 
         if (device) {
@@ -1087,7 +1008,7 @@ export default function CortexProgrammer({
 
       try {
         const rememberedDevices = getWebUsbCmsisDapDevices(
-          (await usb.getDevices?.()) ?? []
+          (await usb.getDevices?.().catch(() => [])) ?? []
         );
         const rememberedDevice =
           selectedAuthorizedProbe?.transport === "webusb"
@@ -1105,9 +1026,7 @@ export default function CortexProgrammer({
               ? `${rememberedDevices.length} authorized WebUSB probes found. Select one in the browser dialog.\n`
               : "Using WebUSB. Select the CMSIS-DAP v2 probe in the browser dialog.\n"
           );
-          device = await usb.requestDevice({
-            filters: KNOWN_CMSIS_DAP_IDS,
-          });
+          device = await usb.requestDevice({ filters: [] });
         }
 
         const usbDevice = device as {
@@ -1122,13 +1041,6 @@ export default function CortexProgrammer({
           `USB device selected: ${usbDevice.productName ?? "unknown product"} ` +
             `(${formatUsbId(usbDevice.vendorId)}:${formatUsbId(usbDevice.productId)})\n`
         );
-
-        if (!looksLikeCmsisDapDevice(usbDevice)) {
-          addLog(
-            `Selected device is not clearly identified as CMSIS-DAP (${formatUsbId(usbDevice.vendorId)}:${formatUsbId(usbDevice.productId)}). Choose another device.\n`
-          );
-          return null;
-        }
 
         rememberSelectedProbe(usbDevice, "webusb");
 

@@ -1,9 +1,10 @@
 import { useState, type ReactNode } from "react";
 import CortexProgrammer from "./components/CortexProgrammer";
 import ESPFlasher from "./components/ESPFlasher";
+import Rp2Programmer from "./components/Rp2Programmer";
 import SerialMonitor from "./components/SerialMonitor";
 
-type DeviceFamily = "py32" | "stm32" | "gd32" | "esp32" | "serial";
+type DeviceFamily = "py32" | "stm32" | "gd32" | "rp2" | "esp32" | "serial";
 type CommunicationInterface = "auto" | "webusb" | "webhid" | "webserial";
 
 type FamilyOption = {
@@ -43,6 +44,13 @@ const FAMILY_OPTIONS: readonly FamilyOption[] = [
     maker: "GigaDevice",
     description: "Familia GD32F1",
     core: "Cortex-M3",
+  },
+  {
+    id: "rp2",
+    label: "RP2",
+    maker: "Raspberry Pi",
+    description: "RP2350 por CMSIS-DAP / SWD",
+    core: "Cortex-M33",
   },
   {
     id: "esp32",
@@ -91,6 +99,9 @@ const ESP_INTERFACES: readonly InterfaceOption[] = [
     recommended: true,
   },
 ];
+const RP2_INTERFACES: readonly InterfaceOption[] = CORTEX_INTERFACES.filter(
+  (option) => option.id === "webusb" || option.id === "webhid"
+);
 
 const LAST_SELECTION_KEY = "panel-loader:last-selection";
 
@@ -146,7 +157,9 @@ function readLastSelection(): {
     const compatibleSelection =
       saved?.family === "esp32" || saved?.family === "serial"
         ? saved?.communication === "webserial"
-        : saved?.communication !== "webserial";
+        : saved?.family === "rp2"
+          ? saved?.communication === "webusb" || saved?.communication === "webhid"
+          : saved?.communication !== "webserial";
 
     if (validFamily && validInterface && compatibleSelection) {
       return saved;
@@ -173,7 +186,9 @@ function App() {
   const availableInterfaces =
     selectedFamily === "esp32" || selectedFamily === "serial"
       ? ESP_INTERFACES
-      : CORTEX_INTERFACES;
+      : selectedFamily === "rp2"
+        ? RP2_INTERFACES
+        : CORTEX_INTERFACES;
   const selectedInterfaceOption = availableInterfaces.find(
     (option) => option.id === selectedInterface
   );
@@ -181,7 +196,8 @@ function App() {
   function chooseFamily(family: DeviceFamily) {
     setSelectedFamily(family);
     setSelectedInterface(
-      family === "esp32" || family === "serial" ? "webserial" : "auto"
+      family === "esp32" || family === "serial" ? "webserial" :
+        family === "rp2" ? "webhid" : "auto"
     );
   }
 
@@ -262,6 +278,11 @@ function App() {
           <SerialMonitor />
         ) : selectedFamily === "esp32" ? (
           <ESPFlasher />
+        ) : selectedFamily === "rp2" ? (
+          <Rp2Programmer
+            initialTransport={selectedInterface as "webusb" | "webhid"}
+            key={`rp2-${selectedInterface}`}
+          />
         ) : (
           <CortexProgrammer
             initialFamily={selectedFamily}

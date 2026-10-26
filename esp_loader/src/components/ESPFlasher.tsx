@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ESPLoader, Transport } from "esptool-js";
 
 const FIRMWARE_FAMILIES = [
@@ -32,6 +32,7 @@ type FirmwareChannel = "standard" | "micropython";
 type EspPortSlot = {
   id: string;
   label: string;
+  displayName: string;
   port: any;
 };
 type EspSlotFlashStatus = {
@@ -127,16 +128,19 @@ function getEspPortSlot(port: any): EspPortSlot {
   const info = port.getInfo?.() ?? {};
   const vendorId = info.usbVendorId?.toString(16).padStart(4, "0") ?? "????";
   const productId = info.usbProductId?.toString(16).padStart(4, "0") ?? "????";
+  const usbId = `${vendorId}:${productId}`;
   let instanceId = 0;
 
   if (typeof port === "object" && port !== null) {
     instanceId = espPortInstanceIds.get(port) ?? nextEspPortInstanceId++;
     espPortInstanceIds.set(port, instanceId);
   }
+  const displayName = `Puerto web ${instanceId}`;
 
   return {
     id: `serial:${vendorId}:${productId}:${instanceId}`,
-    label: `Web Serial · ${vendorId}:${productId}`,
+    label: `${displayName} · USB ${usbId}`,
+    displayName,
     port,
   };
 }
@@ -223,6 +227,10 @@ export default function ESPFlasher() {
 
   const readerRef = useRef<any>(null);
 
+  const releasePromiseRef = useRef<Promise<void> | null>(null);
+
+  const activeTransportsRef = useRef<Set<Transport>>(new Set());
+
   const logsContainerRef = useRef<HTMLDivElement | null>(null);
 
   function getSerialApi() {
@@ -252,26 +260,96 @@ export default function ESPFlasher() {
     readerRef.current = null;
   }
 
-  async function releaseEspPorts() {
-    await stopReading();
+  function createTransport(
+    serialPort: ConstructorParameters<typeof Transport>[0]
+  ) {
+    const transport = new Transport(serialPort);
+    activeTransportsRef.current.add(transport);
+    return transport;
+  }
 
+  const disconnectTransport = useCallback(async (
+    transport: Transport | null | undefined
+  ) => {
+    if (!transport) return;
+
+    try {
+      await transport.disconnect();
+    } finally {
+      activeTransportsRef.current.delete(transport);
+    }
+  }, []);
+
+  const releaseEspPorts = useCallback((): Promise<void> => {
+    if (releasePromiseRef.current) return releasePromiseRef.current;
+
+    // Snapshot every handle before the first await. During a reload the page
+    // can be destroyed quickly, so closing inactive ports must start at once.
+    const activePort = portRef.current;
     const ports = [
-      portRef.current,
+      activePort,
       ...espPortSlotsRef.current.map((slot) => slot?.port),
     ].filter((candidate, index, all) => candidate && all.indexOf(candidate) === index);
+    const activeReader = readerRef.current;
+    readerRef.current = null;
+    const activeTransports = Array.from(activeTransportsRef.current);
 
-    await Promise.all(
-      ports.map(async (serialPort) => {
-        try {
-          await serialPort.close();
-        } catch {
-          // A port may already have been closed by esptool or the browser.
-        }
-      })
+    const releaseReader = (async () => {
+      if (!activeReader) return;
+
+      try {
+        await activeReader.cancel();
+      } catch {
+        // Reader may already be closed.
+      }
+
+      try {
+        activeReader.releaseLock();
+      } catch {
+        // Lock may already be released.
+      }
+    })();
+
+    const transportReleases = new Map(
+      activeTransports.map((transport) => [
+        transport.device,
+        disconnectTransport(transport).catch(() => {
+          // The transport or its port may already be closed.
+        }),
+      ])
     );
 
-    portRef.current = null;
-  }
+    const portReleases = ports.map(async (serialPort) => {
+      // The active port cannot close until its readable stream is unlocked.
+      // Other assigned ports begin closing immediately.
+      if (serialPort === activePort) {
+        await releaseReader;
+      }
+      await transportReleases.get(serialPort);
+
+      try {
+        await serialPort.close();
+      } catch {
+        // A port may already have been closed by esptool or the browser.
+      }
+    });
+
+    const releasePromise = Promise.all([
+      ...portReleases,
+      ...transportReleases.values(),
+    ]).then(() => {
+      portRef.current = null;
+    });
+
+    releasePromiseRef.current = releasePromise;
+    void releasePromise.finally(() => {
+      if (releasePromiseRef.current === releasePromise) {
+        releasePromiseRef.current = null;
+      }
+    });
+
+    return releasePromise;
+  }, [disconnectTransport]);
 
   async function openPortSafely(selectedPort: any, baudRate = 115200) {
     if (!selectedPort) return;
@@ -296,6 +374,17 @@ export default function ESPFlasher() {
       message.toLowerCase().includes("failed to open serial port") ||
       message.toLowerCase().includes("already closed") ||
       message.toLowerCase().includes("serial data stream stopped")
+    );
+  }
+
+  function isUnsupportedControlSignalError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    const normalizedMessage = message.toLowerCase();
+    return (
+      normalizedMessage.includes("setsignals") ||
+      normalizedMessage.includes("control signals") ||
+      normalizedMessage.includes("operation not supported") ||
+      normalizedMessage.includes("cannot set")
     );
   }
 
@@ -496,20 +585,20 @@ export default function ESPFlasher() {
   async function connectESP(slotIndex?: number) {
 
     try {
-
       const serial = getSerialApi();
-
       if (!serial) {
-
         alert("Web Serial API is not supported");
-
         return;
       }
-
       const selectedPort = await serial.requestPort();
 
       if (port && port !== selectedPort) {
         await stopReading();
+        try {
+          await port.close();
+        } catch {
+          // The previously active port may already be closed.
+        }
       }
 
       await openPortSafely(selectedPort, 115200);
@@ -546,7 +635,7 @@ export default function ESPFlasher() {
         nextActiveSlotIndex === -1 ? 0 : nextActiveSlotIndex
       );
 
-      addLog("ESP connected\n");
+      addLog(`ESP conectado: ${nextSlot.label}\n`);
 
       void startReading(selectedPort);
 
@@ -568,6 +657,13 @@ export default function ESPFlasher() {
     try {
       if (port !== slot.port) {
         await stopReading();
+        if (port) {
+          try {
+            await port.close();
+          } catch {
+            // The previously active port may already be closed.
+          }
+        }
         await openPortSafely(slot.port, 115200);
         setActivePort(slot.port);
         void startReading(slot.port);
@@ -592,6 +688,12 @@ export default function ESPFlasher() {
     if (activeEspSlotIndex === slotIndex) {
       await disconnectESP();
       setActiveEspSlotIndex(null);
+    } else {
+      try {
+        await slot.port.close();
+      } catch {
+        // The assigned port may already be closed.
+      }
     }
 
     setEspPortSlots((current) =>
@@ -691,7 +793,7 @@ export default function ESPFlasher() {
 
   async function flashFirmware() {
 
-    let activeTransport: Transport | null = null;
+    let transport: Transport | null = null;
 
     try {
 
@@ -735,8 +837,7 @@ export default function ESPFlasher() {
 
       await delay(100);
 
-      const transport = new Transport(port);
-      activeTransport = transport;
+      transport = createTransport(port);
 
       const esploader = new ESPLoader({
 
@@ -808,8 +909,8 @@ export default function ESPFlasher() {
 
       setProgress(100);
 
-      await esploader.transport.disconnect();
-      activeTransport = null;
+      await disconnectTransport(transport);
+      transport = null;
 
       setConnected(false);
       setActivePort(null);
@@ -822,14 +923,14 @@ export default function ESPFlasher() {
 
       console.error(err);
 
-      try {
-        await activeTransport?.disconnect();
-      } catch {
-        // Best-effort cleanup after detection or flash failure.
-      }
-
       if (isDeviceLostError(err) && port) {
         forgetLostPort(port, "El puerto se perdió durante la programación");
+      }
+
+      try {
+        await disconnectTransport(transport);
+      } catch {
+        // Best-effort cleanup after a failed flash operation.
       }
 
       addLog(`\nFlash Error: ${err.message}\n`);
@@ -918,7 +1019,7 @@ export default function ESPFlasher() {
               // The port can already be closed before esptool opens it.
             }
 
-            transport = new Transport(slot.port);
+            transport = createTransport(slot.port);
             const esploader = new ESPLoader({
               transport,
               baudrate: uploadBaudRate,
@@ -968,7 +1069,7 @@ export default function ESPFlasher() {
               },
             });
 
-            await transport.disconnect();
+            await disconnectTransport(transport);
             transport = null;
             setEspFlashStatuses((current) => ({
               ...current,
@@ -994,7 +1095,7 @@ export default function ESPFlasher() {
             }));
             addLog(`[${slot.label}] Error: ${errorMessage}\n`);
             try {
-              await transport?.disconnect();
+              await disconnectTransport(transport);
             } catch {
               // Best-effort cleanup after a failed flash operation.
             }
@@ -1202,7 +1303,7 @@ export default function ESPFlasher() {
               // The port can already be closed before esptool opens it.
             }
 
-            transport = new Transport(slot.port);
+            transport = createTransport(slot.port);
             const esploader = new ESPLoader({
               transport,
               baudrate: uploadBaudRate,
@@ -1220,7 +1321,7 @@ export default function ESPFlasher() {
             await esploader.main("default_reset");
             const flashDetected = await isFlashDetected(esploader);
             await esploader.eraseFlash();
-            await transport.disconnect();
+            await disconnectTransport(transport);
             transport = null;
             setEspFlashStatuses((current) => ({
               ...current,
@@ -1254,7 +1355,7 @@ export default function ESPFlasher() {
             }));
             addLog(`[${slot.label}] Error: ${errorMessage}\n`);
             try {
-              await transport?.disconnect();
+              await disconnectTransport(transport);
             } catch {
               // Best-effort cleanup after a failed erase operation.
             }
@@ -1324,9 +1425,7 @@ export default function ESPFlasher() {
           }));
           addLog(`[${slot.label}] Reset enviado.\n`);
         } catch (err: any) {
-          const isControlSignalError =
-            err?.message?.includes("setSignals") ||
-            err?.message?.toLowerCase().includes("control signals");
+          const isControlSignalError = isUnsupportedControlSignalError(err);
           setEspFlashStatuses((current) => ({
             ...current,
             [slot.id]: {
@@ -1356,6 +1455,8 @@ export default function ESPFlasher() {
 
   async function eraseFlash() {
 
+    let transport: Transport | null = null;
+
     try {
 
       if (!port) {
@@ -1382,7 +1483,7 @@ export default function ESPFlasher() {
 
       await delay(100);
 
-      const transport = new Transport(port);
+      transport = createTransport(port);
 
       const esploader = new ESPLoader({
 
@@ -1420,7 +1521,8 @@ export default function ESPFlasher() {
 
       setProgress(100);
 
-      await esploader.transport.disconnect();
+      await disconnectTransport(transport);
+      transport = null;
 
       setConnected(false);
       setActivePort(null);
@@ -1435,6 +1537,12 @@ export default function ESPFlasher() {
 
       if (isDeviceLostError(err) && port) {
         forgetLostPort(port, "El puerto se perdió durante el borrado");
+      }
+
+      try {
+        await disconnectTransport(transport);
+      } catch {
+        // Best-effort cleanup after a failed erase operation.
       }
 
       addLog(`\nErase Error: ${err.message}\n`);
@@ -1500,7 +1608,7 @@ export default function ESPFlasher() {
       void releaseEspPorts();
     };
 
-  }, []);
+  }, [releaseEspPorts]);
 
   useEffect(() => {
     portRef.current = port;
@@ -1515,9 +1623,15 @@ export default function ESPFlasher() {
       void releaseEspPorts();
     };
 
+    // beforeunload fires earlier on a reload; pagehide remains as the fallback
+    // for history navigation and browsers that skip beforeunload.
+    window.addEventListener("beforeunload", releaseOnPageExit, { capture: true });
     window.addEventListener("pagehide", releaseOnPageExit);
-    return () => window.removeEventListener("pagehide", releaseOnPageExit);
-  }, []);
+    return () => {
+      window.removeEventListener("beforeunload", releaseOnPageExit, { capture: true });
+      window.removeEventListener("pagehide", releaseOnPageExit);
+    };
+  }, [releaseEspPorts]);
 
   useEffect(() => {
     const serial = getSerialApi();
@@ -1567,7 +1681,14 @@ export default function ESPFlasher() {
   const noFlashEspCount = Object.values(espFlashStatuses).filter(
     (status) => status.state === "no_flash"
   ).length;
-
+  const activeEspSlot =
+    activeEspSlotIndex === null ? null : espPortSlots[activeEspSlotIndex];
+  const activePortDisplayName = connected
+    ? activeEspSlot?.displayName ?? (port ? getEspPortSlot(port).displayName : "Puerto serie")
+    : "—";
+  const activePortDescription = connected
+    ? activeEspSlot?.label ?? activePortDisplayName
+    : "Sin puerto conectado";
   function selectFamily(family: FirmwareFamily) {
     setSelectedFamily(family);
 
@@ -1644,8 +1765,20 @@ export default function ESPFlasher() {
               <div className={`rounded-full border px-2 py-1 font-mono text-[10px] font-bold ${connected ? "border-emerald-300 bg-emerald-50 text-emerald-800" : "border-slate-300 bg-white text-slate-600"}`}>{connected ? "ESP conectado" : "ESP desconectado"}</div>
             </div>
             <div className="grid gap-2">
-              <div className="rounded border border-slate-200 bg-white p-3"><div className="mb-1 text-xs font-semibold text-slate-800">Estación de programación ESP</div><div className="text-[11px] text-slate-500">Selecciona el firmware, conecta el puerto serie y ejecuta la programación de la unidad.</div><div className="mt-3 flex flex-wrap gap-1.5"><button className={`${buttonBase} border-slate-300 bg-white text-slate-700 hover:border-cyan-400 hover:text-cyan-800`} disabled={busy} onClick={connected ? disconnectESP : () => void connectESP()} type="button">{connected ? "Desconectar" : "Conectar ESP"}</button><button className={`${buttonBase} border-slate-300 bg-white text-slate-700 hover:border-slate-500 hover:text-slate-900`} disabled={!connected || busy} onClick={resetESP32} type="button">Reset</button><button className={`${buttonBase} border-amber-500 bg-amber-50 text-amber-900 hover:bg-amber-100`} disabled={!connected || busy} onClick={eraseFlash} type="button">Borrar flash</button><button className={`${buttonBase} border-cyan-500 bg-cyan-400 px-3 text-sm font-bold text-slate-950 shadow-sm hover:bg-cyan-300`} disabled={!connected || !firmware || busy} onClick={flashFirmware} type="button">{flashing ? "Programando..." : "Programar firmware"}</button></div></div>
-              <div className="grid grid-cols-3 overflow-hidden rounded border border-slate-200 bg-white"><div className="border-r border-slate-200 px-2 py-2 text-center"><div className={`font-mono text-sm font-bold ${connected ? "text-emerald-600" : "text-slate-400"}`}>{connected ? "1" : "0"}</div><div className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Conectado</div></div><div className="border-r border-slate-200 px-2 py-2 text-center"><div className="font-mono text-sm font-bold text-cyan-700">{uploadBaudRate >= 1_000_000 ? `${uploadBaudRate / 1_000_000}M` : `${uploadBaudRate / 1_000}k`}</div><div className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Baud</div></div><div className="px-2 py-2 text-center"><div className="font-mono text-sm font-bold text-slate-700">{progress}%</div><div className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Avance</div></div></div>
+              <div className="rounded border border-slate-200 bg-white p-3">
+                <div className="mb-1 text-xs font-semibold text-slate-800">Estación de programación ESP</div>
+                <div className="text-[11px] text-slate-500">Funciona directamente con Web Serial en Chrome/Edge, sin instalar servicios adicionales.</div>
+                <div className="mt-3 flex flex-wrap gap-1.5"><button className={`${buttonBase} border-slate-300 bg-white text-slate-700 hover:border-cyan-400 hover:text-cyan-800`} disabled={busy} onClick={connected ? disconnectESP : () => void connectESP()} type="button">{connected ? "Desconectar" : "Conectar ESP"}</button><button className={`${buttonBase} border-slate-300 bg-white text-slate-700 hover:border-slate-500 hover:text-slate-900`} disabled={!connected || busy} onClick={resetESP32} type="button">Reset</button><button className={`${buttonBase} border-amber-500 bg-amber-50 text-amber-900 hover:bg-amber-100`} disabled={!connected || busy} onClick={eraseFlash} type="button">Borrar flash</button><button className={`${buttonBase} border-cyan-500 bg-cyan-400 px-3 text-sm font-bold text-slate-950 shadow-sm hover:bg-cyan-300`} disabled={!connected || !firmware || busy} onClick={flashFirmware} type="button">{flashing ? "Programando..." : "Programar firmware"}</button></div>
+              </div>
+              <div className="overflow-hidden rounded border border-slate-200 bg-white">
+                <div className="border-b border-slate-200 bg-slate-50 px-2 py-1 text-[10px] font-bold uppercase tracking-wide text-slate-500">Características</div>
+                <div className="grid grid-cols-2 sm:grid-cols-4">
+                  <div className="border-b border-r border-slate-200 px-2 py-2 text-center sm:border-b-0"><div className={`font-mono text-sm font-bold ${connected ? "text-emerald-600" : "text-slate-400"}`}>{connected ? "1" : "0"}</div><div className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Conectado</div></div>
+                  <div className="min-w-0 border-b border-slate-200 px-2 py-2 text-center sm:border-b-0 sm:border-r"><div className={`truncate font-mono text-sm font-bold ${connected ? "text-cyan-700" : "text-slate-400"}`} title={activePortDescription}>{activePortDisplayName}</div><div className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Puerto web</div></div>
+                  <div className="border-r border-slate-200 px-2 py-2 text-center"><div className="font-mono text-sm font-bold text-cyan-700">{uploadBaudRate >= 1_000_000 ? `${uploadBaudRate / 1_000_000}M` : `${uploadBaudRate / 1_000}k`}</div><div className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Baud</div></div>
+                  <div className="px-2 py-2 text-center"><div className="font-mono text-sm font-bold text-slate-700">{progress}%</div><div className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Avance</div></div>
+                </div>
+              </div>
               <fieldset className="min-w-0 rounded border border-slate-200 bg-slate-50/70 p-2">
                 <legend className="px-1 text-xs font-bold uppercase tracking-[0.12em] text-slate-500">Estaciones ESP disponibles</legend>
                 <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2">

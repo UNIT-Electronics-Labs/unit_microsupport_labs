@@ -22,7 +22,7 @@ function isMissingRegister(value: number): boolean {
 
 export async function validateCortexTarget(
   target: CortexM,
-  targetConfig: CortexTargetConfig
+  targetConfig: Exclude<CortexTargetConfig, { family: "rp2" }>
 ): Promise<CortexValidationResult> {
   const cpuid = (await target.readMem32(CORTEX_CPUID_ADDRESS)) >>> 0;
   const corePartNumber = (cpuid >>> 4) & 0x0fff;
